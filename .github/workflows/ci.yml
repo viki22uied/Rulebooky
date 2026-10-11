@@ -27,3 +27,9 @@ jobs:
 
       - name: Compile-check all sources
         run: python -m compileall -q scripts tests
+
+  gate:
+    needs: [tests]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "All test jobs passed."
