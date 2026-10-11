@@ -107,7 +107,8 @@ This keeps your `rules.json`. Add `--purge` to also delete scripts and state.
 
 ## 4. Daily use
 
-Claude runs these commands. You can also run them by hand.
+Claude runs these commands. You can also run them by hand. You can run them
+from any folder in the project.
 
 1. Open a task card before large work:
    ```bash
@@ -197,7 +198,9 @@ runs it on Ubuntu, macOS, and Windows. Result must be `40 passed, 0 failed`.
 | Hooks do not run | Run `RL doctor` first. Fix each FAIL line. Restart Claude Code. Run `/hooks`. Find five rulebooky entries. |
 | `lint` shows errors | Read `references/rules-schema.md`. Fix tier and `check` type. |
 | `audit` stops each time | Run `task done N --evidence "..."` for each item. Meet `min_calls`. |
-| `python3` is not found (Windows) | Use `python` in all commands. Edit hook commands in settings. |
+| `python3` is not found (Windows) | Run `install` again with `--python python`. The hooks will use it. |
+| Install says `not valid JSON` | Fix `.claude/settings.json` by hand. Rulebooky never overwrites it. Run `install` again. |
+| Command prints `rulebooky: ...` | Read the message. Fix the named item. Run the command again. No hidden fault. |
 | Strange acts after hook change | Run `install` again. Restart Claude Code. Read `hook-errors.log`. |
 
 ## 10. Honest limits
