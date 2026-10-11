@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "max_stop_blocks": 3,
+  "canary": "",
+  "rules": [
+    {"id": "no-md-sprawl", "tier": "hard",
+     "text": "Never create new .md files. Rules live only in .claude/rulebooky/rules.json.",
+     "check": {"type": "block_new_files", "glob": "*.md", "allow": ["README.md", "CHANGELOG.md"]}},
+    {"id": "no-force-push", "tier": "hard",
+     "text": "Never run git push --force or reset --hard without asking.",
+     "check": {"type": "deny_bash", "pattern": "git\\s+push\\s+.*--force|git\\s+reset\\s+--hard"}},
+    {"id": "task-card-first", "tier": "process",
+     "text": "Before any non-trivial work: run `task set` (goal, method, forbid) and `task add-req` for each requirement in any document the user told you to follow."},
+    {"id": "evidence-before-done", "tier": "process",
+     "text": "Mark a requirement done only with evidence: `task done N --evidence ...`."},
+    {"id": "point-form", "tier": "soft",
+     "text": "Answer in short point-form unless asked otherwise."}
+  ]
+}
