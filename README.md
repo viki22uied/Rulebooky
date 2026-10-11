@@ -85,13 +85,25 @@ Do these steps:
    ```bash
    cd your-project
    python3 ~/.claude/skills/rulebooky/scripts/rulebooky.py install
-   python3 .claude/rulebooky/rulebooky.py lint
+   python3 .claude/rulebooky/rulebooky.py doctor
    ```
+   The `doctor` command checks all parts. Fix each FAIL line it shows.
+   Install picks a working Python 3 by itself. To force one, add
+   `--python python` to the install command.
 3. Restart Claude Code. Check `/hooks`. You must see five rulebooky entries.
 4. Tell Claude: *Use rulebooky. Here are my rules: ...*
 
 To update, run `git -C ~/.claude/skills/rulebooky pull`. Then run `install`
-again in each project. The command is safe to run twice.
+again in each project. The command is safe to run twice. It keeps a backup
+of your settings at `.claude/settings.json.rulebooky.bak`.
+
+To remove the hooks from a project, run:
+
+```bash
+python3 .claude/rulebooky/rulebooky.py uninstall
+```
+
+This keeps your `rules.json`. Add `--purge` to also delete scripts and state.
 
 ## 4. Daily use
 
@@ -154,7 +166,7 @@ Check counts in the parent session.
 
 ```text
 SKILL.md                    orders that Claude obeys
-scripts/rulebooky.py         CLI: install, lint, task, decide, brief
+scripts/rulebooky.py        CLI: install, doctor, uninstall, lint, task, decide, brief
 scripts/hooks/common.py     shared functions for paths and JSON
 scripts/hooks/inject.py     shows context at start and each prompt
 scripts/hooks/guard.py      stops violations before tool use
@@ -174,15 +186,15 @@ python3 tests/run_tests.py
 ```
 
 The suite builds a test project. It sends fake hook events. It checks stops,
-allow lists, forbid patterns, search counts, proof rules, install safety, and
-fail-open faults. CI runs it on Python 3.8 through 3.12. CI runs it on
-Ubuntu, macOS, and Windows. Result must be `23 passed, 0 failed`.
+allow lists, forbid patterns, search counts, proof rules, install safety,
+uninstall, and fail-open faults. CI runs it on Python 3.8 through 3.12. CI
+runs it on Ubuntu, macOS, and Windows. Result must be `40 passed, 0 failed`.
 
 ## 9. Troubleshooting
 
 | Symptom | Action |
 |---|---|
-| Hooks do not run | Restart Claude Code. Run `/hooks`. Find five rulebooky entries. |
+| Hooks do not run | Run `RL doctor` first. Fix each FAIL line. Restart Claude Code. Run `/hooks`. Find five rulebooky entries. |
 | `lint` shows errors | Read `references/rules-schema.md`. Fix tier and `check` type. |
 | `audit` stops each time | Run `task done N --evidence "..."` for each item. Meet `min_calls`. |
 | `python3` is not found (Windows) | Use `python` in all commands. Edit hook commands in settings. |

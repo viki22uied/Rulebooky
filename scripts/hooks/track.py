@@ -7,6 +7,7 @@ from common import *  # noqa
 
 
 def main():
+    setup_io()
     ev = read_event()
     tool = ev.get("tool_name")
     if not tool:

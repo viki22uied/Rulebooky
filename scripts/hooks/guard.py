@@ -46,6 +46,7 @@ def check(ev, rules, state):
 
 
 def main():
+    setup_io()
     ev = read_event()
     problems = check(ev, load_rules(), load_state())
     if problems:

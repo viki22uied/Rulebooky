@@ -7,7 +7,20 @@ from pathlib import Path
 
 
 def project_dir():
+    """Installed scripts locate the project from their own path, so cwd never matters."""
+    here = Path(__file__).resolve()
+    if len(here.parents) > 3 and here.parents[1].name == "rulebooky" and here.parents[2].name == ".claude":
+        return here.parents[3]
     return Path(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+
+
+def setup_io():
+    """Force UTF-8 so non-ASCII rule text cannot crash hooks on Windows/cp1252 consoles."""
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 
 def rl_dir():

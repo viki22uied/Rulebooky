@@ -22,7 +22,7 @@ CLI: `python3 .claude/rulebooky/rulebooky.py <cmd>` (call it `RL` below).
    - **soft**: style/behaviour that cannot be checked (tone, format). Max 10.
 4. If a rule cannot be made hard, tell the user plainly it is advisory. Do not pretend it is enforced.
 5. Keep rules short, imperative, testable. Max 25 total. Merge duplicates, drop vague ones ("follow best practices").
-6. Run `RL lint`, fix errors, then tell the user to restart Claude Code so hooks load.
+6. Run `RL doctor`, fix every FAIL line, then tell the user to restart Claude Code so hooks load. If anything misbehaves later, run `RL doctor` first.
 
 ## 2. Every non-trivial task
 1. Before doing anything else: `RL task set --goal "..." --method "..." [--forbid REGEX]... [--min WebSearch=N] [--done-when "..."]`.

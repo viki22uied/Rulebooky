@@ -7,6 +7,7 @@ from common import *  # noqa
 
 
 def main():
+    setup_io()
     mode = sys.argv[1] if len(sys.argv) > 1 else "prompt"
     read_event()
     rules, state = load_rules(), load_state()

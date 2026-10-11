@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PY = sys.executable
+MARK = "rulebooky/hooks/"
 passed = failed = 0
 
 
@@ -100,6 +101,77 @@ with tempfile.TemporaryDirectory() as d:
     check("corrupt rules => hooks fail open", run(proj, "hooks/guard.py",
           {"tool_name": "Bash", "tool_input": {"command": "ls"}}).returncode == 0)
     check("lint flags corrupt rules", cli(proj, "lint").returncode == 1)
+
+
+# ---- hardening: things real users hit ----
+def install(proj, *extra):
+    return subprocess.run([PY, str(ROOT / "scripts/rulebooky.py"), "install", "--project", str(proj)] + list(extra),
+                          capture_output=True, text=True)
+
+
+with tempfile.TemporaryDirectory() as d:
+    proj = Path(d)
+    (proj / ".claude").mkdir()
+    bad = '{ "hooks": { // comment makes this invalid JSON\n }'
+    (proj / ".claude/settings.json").write_text(bad)
+    r = install(proj)
+    check("install refuses invalid settings.json", r.returncode == 1 and "not valid JSON" in r.stdout)
+    check("invalid settings.json left untouched", (proj / ".claude/settings.json").read_text() == bad)
+    check("no half-installed files on refusal", not (proj / ".claude/rulebooky").exists())
+    check("no traceback on refusal", "Traceback" not in r.stderr)
+
+with tempfile.TemporaryDirectory() as d:
+    proj = Path(d)
+    (proj / ".claude").mkdir()
+    orig = {"model": "x", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}}
+    (proj / ".claude/settings.json").write_text(json.dumps(orig))
+    install(proj)
+    check("install makes a settings backup", (proj / ".claude/settings.json.rulebooky.bak").exists())
+    r = cli(proj, "doctor")
+    check("doctor passes on fresh install", r.returncode == 0 and "All good" in r.stdout)
+    sub = proj / "deep" / "er"
+    sub.mkdir(parents=True)
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}
+    r = subprocess.run([PY, str(proj / ".claude/rulebooky/rulebooky.py"), "task", "set", "--goal", "g"],
+                       capture_output=True, text=True, cwd=str(sub), env=env)
+    check("CLI works from a subdirectory without env var", r.returncode == 0 and (proj / ".claude/rulebooky/state.json").exists())
+    check("state not written to the subdirectory", not (sub / ".claude").exists())
+    r = cli(proj, "task", "done", "9", "--evidence", "x")
+    check("task done out of range: friendly error", r.returncode == 1 and "No requirement 9" in r.stdout and "Traceback" not in r.stderr)
+    r = cli(proj, "task", "set", "--goal", "g", "--forbid", "(unclosed")
+    check("bad forbid regex: friendly error", r.returncode == 1 and "not a valid regex" in r.stdout and "Traceback" not in r.stderr)
+    r = cli(proj, "task", "set", "--goal", "g", "--min", "WebSearch")
+    check("bad --min: friendly error", r.returncode == 1 and "WebSearch=5" in r.stdout)
+
+    # unicode rule text must survive a non-UTF-8 console
+    rules = json.loads((proj / ".claude/rulebooky/rules.json").read_text(encoding="utf-8"))
+    rules["rules"].append({"id": "uni", "tier": "soft", "text": "Use \u201csmart quotes\u201d \u2014 \u00e9\u00e8 \u4e2d\u6587"})
+    (proj / ".claude/rulebooky/rules.json").write_text(json.dumps(rules), encoding="utf-8")
+    env = dict(os.environ, CLAUDE_PROJECT_DIR=str(proj), PYTHONIOENCODING="ascii")
+    r = subprocess.run([PY, str(proj / ".claude/rulebooky/hooks/inject.py"), "session"], input=b"{}",
+                       capture_output=True, env=env)
+    check("inject survives ascii console with unicode rules", r.returncode == 0 and "smart quotes".encode() in r.stdout)
+
+    # doctor catches breakage
+    (proj / ".claude/rulebooky/hooks/guard.py").unlink()
+    r = cli(proj, "doctor")
+    check("doctor FAILs on missing hook script", r.returncode == 1 and "missing: guard.py" in r.stdout)
+    install(proj)
+
+    # uninstall keeps the user's own hook and settings
+    r = cli(proj, "uninstall")
+    s = json.loads((proj / ".claude/settings.json").read_text())
+    check("uninstall removes only rulebooky hooks", s.get("hooks", {}).get("Stop") == orig["hooks"]["Stop"]
+          and all(MARK not in json.dumps(v) for v in s.get("hooks", {}).values()) and s["model"] == "x")
+    check("uninstall keeps rules.json by default", (proj / ".claude/rulebooky/rules.json").exists())
+    cli(proj, "uninstall", "--purge")
+    check("purge removes scripts but keeps rules.json", not (proj / ".claude/rulebooky/hooks").exists()
+          and (proj / ".claude/rulebooky/rules.json").exists())
+
+with tempfile.TemporaryDirectory() as d:
+    r = subprocess.run([PY, str(ROOT / "scripts/rulebooky.py"), "task", "set", "--goal", "g"],
+                       capture_output=True, text=True, cwd=d, env={k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"})
+    check("commands before install: friendly message", r.returncode == 1 and "not installed" in r.stdout and "Traceback" not in r.stderr)
 
 print("\n%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

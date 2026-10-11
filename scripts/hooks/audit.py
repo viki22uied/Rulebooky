@@ -21,6 +21,7 @@ def problems_for(rules, state):
 
 
 def main():
+    setup_io()
     read_event()
     rules, state = load_rules(), load_state()
     probs = problems_for(rules, state)
