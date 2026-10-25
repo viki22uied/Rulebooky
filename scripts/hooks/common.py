@@ -48,6 +48,26 @@ def save_json(path, data):
     tmp = p.with_name(p.name + ".tmp")
     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     os.replace(str(tmp), str(p))
+    # Auto-log rules.json changes
+    if p.name == "rules.json":
+        log_rules_change(data)
+
+
+def log_rules_change(new_rules):
+    """Append rules change to history log."""
+    try:
+        history_path = rl_dir() / "rules-history.jsonl"
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "rules_count": len(new_rules.get("rules", [])),
+            "rule_ids": [r.get("id") for r in new_rules.get("rules", [])],
+            "version": new_rules.get("version", 1)
+        }
+        with open(str(history_path), "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 def read_event():
@@ -82,6 +102,27 @@ def log_error(msg):
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(str(p), "a", encoding="utf-8") as f:
             f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
+def log_action(event_type, tool_name, tool_input, result, rule_id=None, rule_text=None):
+    """Log rule enforcement actions for observability."""
+    try:
+        p = rl_dir() / "actions.log"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "type": event_type,  # "blocked", "allowed", "stop_block", "task_set", "task_done", "task_close"
+            "tool": tool_name,
+            "input": tool_input,
+            "result": result,  # "blocked" | "allowed" | "stop_blocked"
+            "rule_id": rule_id,
+            "rule_text": rule_text,
+            "task_goal": (C.load_state().get("task") or {}).get("goal", "") if event_type in ("blocked", "allowed") else ""
+        }
+        with open(str(p), "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:
         pass
 

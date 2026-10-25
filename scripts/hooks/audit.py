@@ -33,10 +33,13 @@ def main():
     limit = int(rules.get("max_stop_blocks", 3))
     if state.get("stop_blocks", 0) >= limit:
         # escape hatch so a bad task card cannot trap the session forever
+        log_action("stop_block", "Stop", {}, "escape_hatch", "max_stop_blocks", 
+                   f"Allowed after {limit} blocks: {'; '.join(probs)}")
         sys.stderr.write("rulebooky: stop allowed after %d blocks, UNMET: %s\n" % (limit, "; ".join(probs)))
         return
     state["stop_blocks"] = state.get("stop_blocks", 0) + 1
     save_state(state)
+    log_action("stop_block", "Stop", {}, "blocked", "audit", "; ".join(probs))
     sys.stderr.write("Do not finish yet. Unmet:\n- " + "\n- ".join(probs) +
                      "\nDo the work, then mark requirements with: "
                      "python3 .claude/rulebooky/rulebooky.py task done N --evidence \"...\" "
