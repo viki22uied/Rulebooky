@@ -17,7 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "hooks"))
 import common as C  # noqa: E402
@@ -34,6 +34,37 @@ TIERS = ("hard", "process", "soft")
 HARD_CHECKS = ("deny_bash", "deny_path", "block_new_files")
 VAGUE = ("best practice", "clean code", "properly", "appropriate", "as needed",
          "good ", "efficient", "high quality", "robust")
+
+# Rule discovery patterns
+DISCOVERY_PATTERNS = [
+    (r"(?i)don['']?t\s+(create|make|add|write)\s+(new\s+)?(\.md|markdown)\s+files?", 
+     {"id": "no-md-sprawl", "tier": "hard", "text": "Never create new .md files. Rules live only in .claude/rulebooky/rules.json.", 
+      "check": {"type": "block_new_files", "glob": "*.md", "allow": ["README.md", "CHANGELOG.md"]}}),
+    (r"(?i)don['']?t\s+(run|use|execute)\s+git\s+push\s+.*--force",
+     {"id": "no-force-push", "tier": "hard", "text": "Never run git push --force or reset --hard without asking.",
+      "check": {"type": "deny_bash", "pattern": "git\\s+push\\s+.*--force|git\\s+reset\\s+--hard"}}),
+    (r"(?i)don['']?t\s+(touch|modify|edit|change)\s+([`\"']?)migrations?/\2",
+     {"id": "no-migrations-touch", "tier": "hard", "text": "Never touch migrations/ directory.",
+      "check": {"type": "deny_path", "pattern": "migrations/"}}),
+    (r"(?i)(search|research|look up|find)\s+(thoroughly|deeply|extensively|at least\s+(\d+)\s+times?)",
+     {"id": "min-search", "tier": "process", "text": "Search thoroughly before answering (at least 3 WebSearch calls).",
+      "check": {"type": "min_calls", "tool": "WebSearch", "n": 3}}),
+    (r"(?i)don['']?t\s+(commit|push)\s+(secrets?|passwords?|keys?|tokens?|api[_-]?keys?)",
+     {"id": "no-secrets", "tier": "hard", "text": "Never commit secrets, passwords, keys, or tokens.",
+      "check": {"type": "deny_bash", "pattern": "(password|secret|api[_-]?key|token)\\s*="}}),
+    (r"(?i)don['']?t\s+(install|add)\s+(packages?|dependencies|deps)\s+without\s+(asking|approval)",
+     {"id": "no-deps-without-ask", "tier": "hard", "text": "Never install dependencies without asking.",
+      "check": {"type": "deny_bash", "pattern": "(npm|yarn|pnpm|pip|poetry|go get|cargo add)\\s+(install|add)"}}),
+    (r"(?i)(answer|respond|reply)\s+(in|with)\s+(short|brief|concise)\s+(point[-\s]?form|bullets?)",
+     {"id": "point-form", "tier": "soft", "text": "Answer in short point-form unless asked otherwise."}),
+    (r"(?i)don['']?t\s+(create|make)\s+(new\s+)?files?\s+(unless|without)\s+(necessary|needed|asked)",
+     {"id": "no-unnecessary-files", "tier": "soft", "text": "Don't create new files unless necessary or asked."}),
+    (r"(?i)(follow|adhere to|comply with)\s+([`\"']?)([^`\"'\n]+)\2",
+     {"id": "follow-spec", "tier": "process", "text": "Follow the specified document/spec exactly.",
+      "check": {"type": "min_calls", "tool": "Read", "n": 1}}),
+]
+
+RULE_FILES = ["CLAUDE.md", ".cursorrules", "AGENTS.md", ".clauderc", "rules.md", "instructions.md", "CONTRIBUTING.md"]
 
 
 class Fail(Exception):
@@ -127,7 +158,7 @@ def cmd_install(a):
         gi.write_text(cur + ("" if cur.endswith("\n") or not cur else "\n") + "\n".join(add) + "\n",
                       encoding="utf-8")
     print("Installed into %s (hooks use: %s)" % (dst, py))
-    print("Next: edit %s, then run `doctor`. Restart Claude Code so hooks load." % rules)
+    print("Next: edit %s, then run `python .claude/rulebooky/rulebooky.py doctor`. Restart Claude Code so hooks load." % rules)
 
 
 def cmd_uninstall(a):
@@ -202,6 +233,8 @@ def cmd_doctor(a):
                            capture_output=True, text=True, encoding="utf-8")
         line(r.returncode == 0 and "[RULEBOOKY]" in r.stdout, "inject.py prints the rules")
     print("\nAll good." if not bad else "\n%d problem(s). Fix the FAIL lines, then restart Claude Code." % len(bad))
+    if bad:
+        print("Run: python .claude/rulebooky/rulebooky.py doctor  (after fixes)")
     return 1 if bad else 0
 
 
@@ -264,6 +297,393 @@ def cmd_lint(a):
         len(rs), sum(r.get("tier") == "hard" for r in rs),
         sum(r.get("tier") == "process" for r in rs), soft))
     return 1 if errs else 0
+
+
+# ---------- rule discovery ----------
+
+def extract_rules_from_text(text, source):
+    """Extract candidate rules from rule document text."""
+    found = []
+    for pattern, template in DISCOVERY_PATTERNS:
+        matches = list(re.finditer(pattern, text))
+        if matches:
+            rule = dict(template)
+            rule["_source"] = source
+            rule["_matches"] = [m.group(0) for m in matches[:3]]
+            found.append(rule)
+    return found
+
+
+def scan_rule_files(proj):
+    """Scan project for common rule files and extract rules."""
+    all_found = []
+    for fname in RULE_FILES:
+        for path in proj.rglob(fname):
+            if any(p in path.parts for p in ("node_modules", ".git", ".claude", "skills")):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+                found = extract_rules_from_text(text, str(path.relative_to(proj)))
+                all_found.extend(found)
+            except Exception:
+                pass
+    return all_found
+
+
+def deduplicate_rules(rules):
+    """Merge rules with same id, keeping first."""
+    seen = {}
+    for r in rules:
+        rid = r.get("id")
+        if rid not in seen:
+            seen[rid] = r
+    return list(seen.values())
+
+
+def cmd_discover(a):
+    need_installed()
+    proj = C.project_dir()
+    
+    print(f"Scanning {proj} for rule files...")
+    found = scan_rule_files(proj)
+    found = deduplicate_rules(found)
+    
+    if not found:
+        print("No recognizable rules found in common rule files.")
+        print("Checked:", ", ".join(RULE_FILES))
+        return 0
+    
+    print(f"\nFound {len(found)} candidate rule(s):\n")
+    
+    rules_path = C.rules_path()
+    existing = C.load_json(rules_path, {"rules": []})
+    existing_ids = {r.get("id") for r in existing.get("rules", [])}
+    
+    to_add = []
+    for r in found:
+        rid = r.get("id")
+        status = "EXISTS" if rid in existing_ids else "NEW"
+        print(f"  [{status}] {rid} ({r.get('tier')}) - {r.get('text')[:80]}...")
+        if r.get("_matches"):
+            for m in r["_matches"]:
+                print(f"      matched: \"{m[:100]}\"")
+        if status == "NEW":
+            to_add.append(r)
+    
+    if not to_add:
+        print("\nAll rules already exist in rules.json")
+        return 0
+    
+    if a.apply:
+        for r in to_add:
+            clean = {k: v for k, v in r.items() if not k.startswith("_")}
+            existing["rules"].append(clean)
+        C.save_json(rules_path, existing)
+        print(f"\nApplied {len(to_add)} new rule(s) to {rules_path}")
+        print("Run: python .claude/rulebooky/rulebooky.py lint")
+    else:
+        print(f"\nRun with --apply to add {len(to_add)} new rule(s) to rules.json")
+    return 0
+
+
+# ---------- rule test sandbox ----------
+
+def simulate_tool_call(tool_name, tool_input, rules, state):
+    """Simulate guard.py check without blocking."""
+    from hooks.guard import check
+    ev = {"tool_name": tool_name, "tool_input": tool_input}
+    return check(ev, rules, state)
+
+
+def cmd_test(a):
+    need_installed()
+    rules = C.load_rules()
+    state = C.load_state()
+    
+    if a.rule_file:
+        rule_data = C.load_json(a.rule_file, None)
+        if rule_data is None:
+            raise Fail(f"Cannot read rule file: {a.rule_file}")
+        test_rules = {"rules": [rule_data] if isinstance(rule_data, dict) else rule_data.get("rules", [])}
+    elif a.rule_json:
+        try:
+            rule_data = json.loads(a.rule_json)
+        except json.JSONDecodeError as e:
+            raise Fail(f"Invalid JSON: {e}")
+        test_rules = {"rules": [rule_data] if isinstance(rule_data, dict) else rule_data.get("rules", [])}
+    else:
+        test_rules = rules
+    
+    if a.tool and a.input:
+        try:
+            tool_input = json.loads(a.input)
+        except json.JSONDecodeError as e:
+            raise Fail(f"Invalid input JSON: {e}")
+        problems = simulate_tool_call(a.tool, tool_input, test_rules, state)
+        if problems:
+            print("BLOCKED:")
+            for p in problems:
+                print(f"  - {p}")
+        else:
+            print("ALLOWED: No rule violations")
+    elif a.scenario:
+        # Run multiple test cases from a scenario file
+        scenario = C.load_json(a.scenario, None)
+        if not scenario or "tests" not in scenario:
+            raise Fail("Scenario file must have a 'tests' array")
+        for i, test in enumerate(scenario["tests"], 1):
+            tool = test.get("tool")
+            inp = test.get("input", {})
+            expected = test.get("expected", "allowed")
+            problems = simulate_tool_call(tool, inp, test_rules, state)
+            blocked = bool(problems)
+            status = "BLOCKED" if blocked else "ALLOWED"
+            match = "✓" if (blocked and expected == "blocked") or (not blocked and expected == "allowed") else "✗"
+            print(f"Test {i}: {match} {status} (expected {expected}) - {tool}")
+            if problems:
+                for p in problems:
+                    print(f"    - {p}")
+    else:
+        raise Fail("Provide --tool/--input or --scenario")
+    return 0
+
+
+# ---------- observability log ----------
+
+def parse_since(since_str):
+    """Parse '7d', '24h', '30m' into seconds ago."""
+    import re
+    m = re.match(r"(\d+)([dhms])", since_str)
+    if not m:
+        return 0
+    val, unit = int(m.group(1)), m.group(2)
+    mult = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+    return time.time() - val * mult[unit]
+
+
+def cmd_log(a):
+    need_installed()
+    log_path = C.rl_dir() / "actions.log"
+    if not log_path.exists():
+        print("No actions.log found. Run some tasks first.")
+        return 0
+    
+    since_ts = parse_since(a.since) if a.since else 0
+    filter_type = a.type
+    filter_tool = a.tool
+    
+    entries = []
+    with open(log_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                if since_ts and entry.get("ts"):
+                    try:
+                        entry_ts = time.mktime(time.strptime(entry["ts"], "%Y-%m-%d %H:%M:%S"))
+                        if entry_ts < since_ts:
+                            continue
+                    except Exception:
+                        pass
+                if filter_type and entry.get("type") != filter_type:
+                    continue
+                if filter_tool and entry.get("tool") != filter_tool:
+                    continue
+                entries.append(entry)
+            except json.JSONDecodeError:
+                pass
+    
+    if a.format == "json":
+        print(json.dumps(entries, indent=2))
+        return 0
+    
+    if not entries:
+        print("No matching log entries.")
+        return 0
+    
+    # Summary stats
+    blocked = sum(1 for e in entries if e.get("result") == "blocked")
+    allowed = sum(1 for e in entries if e.get("result") == "allowed")
+    stop_blocks = sum(1 for e in entries if e.get("type") == "stop_block")
+    
+    print(f"Total: {len(entries)} | Blocked: {blocked} | Allowed: {allowed} | Stop blocks: {stop_blocks}")
+    print()
+    
+    if a.format == "summary":
+        # Group by rule
+        by_rule = {}
+        for e in entries:
+            if e.get("type") == "blocked":
+                rid = e.get("rule_id", "unknown")
+                by_rule[rid] = by_rule.get(rid, 0) + 1
+        if by_rule:
+            print("Blocks by rule:")
+            for rid, count in sorted(by_rule.items(), key=lambda x: -x[1]):
+                print(f"  {rid}: {count}")
+        return 0
+    
+    # Default: table format
+    for e in entries[-a.limit:]:
+        ts = e.get("ts", "")
+        typ = e.get("type", "")
+        tool = e.get("tool", "")
+        result = e.get("result", "")
+        rule = e.get("rule_id", "")
+        text = e.get("rule_text", "")[:60]
+        if typ == "blocked":
+            print(f"{ts}  BLOCKED  {tool:12}  {rule:20}  {text}")
+        elif typ == "stop_block":
+            print(f"{ts}  STOP_BLOCK                    {rule:20}  {text}")
+        else:
+            print(f"{ts}  ALLOWED  {tool:12}")
+    return 0
+
+
+# ---------- rule history / blame ----------
+
+def cmd_history(a):
+    need_installed()
+    hist_path = C.rl_dir() / "rules-history.jsonl"
+    if not hist_path.exists():
+        print("No rules-history.jsonl found.")
+        return 0
+    
+    entries = []
+    with open(hist_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    
+    if a.rule_id:
+        # Blame mode: show history for specific rule
+        found = False
+        for e in entries:
+            if a.rule_id in e.get("rule_ids", []):
+                print(f"{e['ts']}  v{e.get('version',1)}  {e['rules_count']} rules  (+{a.rule_id})")
+                found = True
+        if not found:
+            print(f"Rule '{a.rule_id}' not found in history")
+        return 0
+    
+    # Full history
+    for e in entries[-a.limit:]:
+        added = set(e.get("rule_ids", []))
+        if entries:
+            prev_ids = set(entries[entries.index(e)-1].get("rule_ids", [])) if entries.index(e) > 0 else set()
+            new_rules = added - prev_ids
+            removed_rules = prev_ids - added
+            changes = []
+            if new_rules:
+                changes.append(f"+{','.join(new_rules)}")
+            if removed_rules:
+                changes.append(f"-{','.join(removed_rules)}")
+            change_str = " ".join(changes) if changes else "no change"
+        else:
+            change_str = f"init {len(added)} rules"
+        print(f"{e['ts']}  v{e.get('version',1)}  {e['rules_count']} rules  {change_str}")
+    return 0
+
+
+# ---------- team sync ----------
+
+def cmd_sync(a):
+    need_installed()
+    rules_path = C.rules_path()
+    rules = C.load_json(rules_path, None)
+    if rules is None:
+        raise Fail("No readable rules.json")
+    
+    if a.sub == "push":
+        # Push to GitHub Gist (requires gh CLI)
+        import subprocess
+        try:
+            # Create or update gist
+            desc = f"rulebooky rules for {C.project_dir().name}"
+            content = json.dumps(rules, indent=2)
+            result = subprocess.run(
+                ["gh", "gist", "create", "--desc", desc, "-f", "rules.json", "-"],
+                input=content.encode(),
+                capture_output=True
+            )
+            if result.returncode != 0:
+                # Try update if exists
+                gist_id = a.gist_id or rules.get("gist_id")
+                if gist_id:
+                    result = subprocess.run(
+                        ["gh", "gist", "edit", gist_id, "-f", "rules.json", "-"],
+                        input=content.encode(),
+                        capture_output=True
+                    )
+            if result.returncode == 0:
+                url = result.stdout.decode().strip()
+                # Extract gist ID from URL
+                import re
+                m = re.search(r"/([a-f0-9]{32})", url)
+                if m:
+                    rules["gist_id"] = m.group(1)
+                    C.save_json(rules_path, rules)
+                print(f"Pushed to: {url}")
+            else:
+                raise Fail(f"gh gist failed: {result.stderr.decode()}")
+        except FileNotFoundError:
+            raise Fail("GitHub CLI (gh) not installed. Install: https://cli.github.com")
+    
+    elif a.sub == "pull":
+        import subprocess
+        gist_id = a.gist_id or rules.get("gist_id")
+        if not gist_id:
+            raise Fail("No gist_id. Provide --gist-id or run push first.")
+        result = subprocess.run(["gh", "gist", "view", gist_id, "--raw", "rules.json"], capture_output=True)
+        if result.returncode != 0:
+            raise Fail(f"Failed to pull: {result.stderr.decode()}")
+        remote_rules = json.loads(result.stdout.decode())
+        # Merge strategy: keep local task card, update rules
+        local_state = C.load_state()
+        C.save_json(rules_path, remote_rules)
+        print(f"Pulled rules from gist {gist_id} ({len(remote_rules.get('rules', []))} rules)")
+        print("Run: python .claude/rulebooky/rulebooky.py lint")
+    
+    elif a.sub == "ci":
+        # CI validation: exit 1 if rules.json differs from remote
+        import subprocess
+        gist_id = a.gist_id or rules.get("gist_id")
+        if not gist_id:
+            print("No remote gist configured. Skipping CI check.")
+            return 0
+        result = subprocess.run(["gh", "gist", "view", gist_id, "--raw", "rules.json"], capture_output=True)
+        if result.returncode != 0:
+            raise Fail(f"Cannot fetch remote rules: {result.stderr.decode()}")
+        remote_rules = json.loads(result.stdout.decode())
+        # Compare rule IDs and content (ignore version, gist_id)
+        local_rules = [r for r in rules.get("rules", []) if r.get("id")]
+        remote_rule_list = [r for r in remote_rules.get("rules", []) if r.get("id")]
+        local_ids = {r["id"]: r for r in local_rules}
+        remote_ids = {r["id"]: r for r in remote_rule_list}
+        
+        if local_ids.keys() != remote_ids.keys():
+            print("RULES DIVERGED: Rule IDs differ")
+            print(f"  Local only:  {set(local_ids) - set(remote_ids)}")
+            print(f"  Remote only: {set(remote_ids) - set(local_ids)}")
+            return 1
+        
+        for rid, local in local_ids.items():
+            remote = remote_ids[rid]
+            # Compare check config and text
+            if local.get("text") != remote.get("text") or local.get("check") != remote.get("check"):
+                print(f"RULE DIVERGED: {rid}")
+                print(f"  Local text:  {local.get('text')[:80]}")
+                print(f"  Remote text: {remote.get('text')[:80]}")
+                return 1
+        
+        print("CI OK: rules.json matches remote")
+        return 0
+    return 0
 
 
 def cmd_status(a):
@@ -334,6 +754,34 @@ def main():
     sp.add_parser("status").set_defaults(f=cmd_status)
     sp.add_parser("brief").set_defaults(f=cmd_status)
     d = sp.add_parser("decide"); d.add_argument("text"); d.set_defaults(f=cmd_decide)
+    disc = sp.add_parser("discover"); disc.add_argument("--apply", action="store_true"); disc.set_defaults(f=cmd_discover)
+    test = sp.add_parser("test")
+    test.add_argument("--rule-file"); test.add_argument("--rule-json")
+    test.add_argument("--tool"); test.add_argument("--input")
+    test.add_argument("--scenario")
+    test.set_defaults(f=cmd_test)
+    log = sp.add_parser("log")
+    log.add_argument("--since", help="Time window: 7d, 24h, 30m")
+    log.add_argument("--type", help="Filter by type: blocked, allowed, stop_block")
+    log.add_argument("--tool", help="Filter by tool name")
+    log.add_argument("--format", choices=["table", "json", "summary"], default="table")
+    log.add_argument("--limit", type=int, default=50)
+    log.set_defaults(f=cmd_log)
+    hist = sp.add_parser("history")
+    hist.add_argument("rule_id", nargs="?", help="Show history for specific rule (blame)")
+    hist.add_argument("--limit", type=int, default=20)
+    hist.set_defaults(f=cmd_history)
+    sync = sp.add_parser("sync")
+    sync_sub = sync.add_subparsers(dest="sub", required=True)
+    sp_push = sync_sub.add_parser("push")
+    sp_push.add_argument("--gist-id")
+    sp_push.set_defaults(f=cmd_sync)
+    sp_pull = sync_sub.add_parser("pull")
+    sp_pull.add_argument("--gist-id")
+    sp_pull.set_defaults(f=cmd_sync)
+    sp_ci = sync_sub.add_parser("ci")
+    sp_ci.add_argument("--gist-id")
+    sp_ci.set_defaults(f=cmd_sync)
     t = sp.add_parser("task"); ts = t.add_subparsers(dest="sub", required=True)
     s = ts.add_parser("set"); s.add_argument("--goal", required=True); s.add_argument("--method")
     s.add_argument("--forbid", action="append"); s.add_argument("--min", action="append")
