@@ -11,10 +11,10 @@ All state lives in two files. Never create other files for rules or notes.
 - `.claude/rulebooky/rules.json`: the only rule store (committed)
 - `.claude/rulebooky/state.json`: current task card, counters, decisions (not committed)
 
-CLI: `python3 .claude/rulebooky/rulebooky.py <cmd>` (call it `RL` below).
+CLI: `python .claude/rulebooky/rulebooky.py <cmd>` (call it `RL` below).
 
 ## 1. First-time setup
-1. Run `python3 <this-skill-dir>/scripts/rulebooky.py install` in the project root.
+1. Run `python <this-skill-dir>/scripts/rulebooky.py install` in the project root.
 2. Collect the user's rules (they may paste messy docs, CLAUDE.md files, chat history). Merge everything into `rules.json`. Do not copy the source files.
 3. Classify each rule. Be strict about tiers:
    - **hard**: a tool call can be detected and blocked. Needs a `check` (see `references/rules-schema.md`). Examples: no new .md files, no force push, never touch `migrations/`.
@@ -43,6 +43,16 @@ Subagents do not inherit this conversation. Paste the output of `RL brief` at th
 
 ## 5. Changing rules
 Edit only `rules.json`, then `RL lint`. When the user corrects you, turn the correction into one new checkable rule (hard if detectable), not a paragraph. Never write rules into new .md files.
+
+## 6. New commands (v0.2+)
+
+- `RL discover` — scan CLAUDE.md, .cursorrules, AGENTS.md for rules. `--apply` adds them.
+- `RL test --scenario FILE` — dry-run rules against test cases. No hooks triggered.
+- `RL log [--since 7d] [--type blocked] [--format summary]` — view enforcement history.
+- `RL history [rule-id]` — audit trail of rules.json changes. Blame one rule.
+- `RL sync push|pull|ci` — share rules via GitHub Gist. `ci` fails if local != remote.
+
+Subagents now auto-receive rules + task card via Task tool. No manual `RL brief` paste needed.
 
 ## Limits to state honestly
 Hooks cannot judge quality or method. They enforce what a tool call, a count, or a checklist can show. Bash can bypass file-path rules, so add `deny_bash` patterns for the risky commands.

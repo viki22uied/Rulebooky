@@ -8,6 +8,25 @@ All big changes are listed here. Format follows
 
 No changes yet.
 
+## [0.2.0] - 2026-10-31
+
+### Added
+
+- `discover` command: scan CLAUDE.md, .cursorrules, AGENTS.md and other rule files. Suggest checkable rules with tier and check config. `--apply` writes to rules.json.
+- `test` command: dry-run rules against sample inputs. `--scenario` runs multiple test cases from a JSON file. Shows pass/fail per case.
+- `log` command: view blocked/allowed actions, stop blocks. Filters: `--since 7d`, `--type blocked`, `--tool Bash`. Formats: table, json, summary.
+- `history` command: audit trail of every rules.json change. `history <rule-id>` shows blame for one rule.
+- `sync` command: push/pull rules to GitHub Gist via `gh` CLI. `sync ci` validates rules.json matches remote (exit 1 if diverged).
+- Subagent auto-propagation: Task tool calls automatically receive rules + task card. No manual `RL brief` copy needed.
+- Observability: all blocks, allows, stop blocks logged to `.claude/rulebooky/actions.log` (JSONL).
+- Cross-platform: `python` used everywhere (not `python3`). Windows users no longer need `--python python`.
+
+### Changed
+
+- `doctor` output now says "Run: python .claude/rulebooky/rulebooky.py doctor" after fixes.
+- README: all examples use `python` (cross-platform). Added sections for discover, test, log, history, sync.
+- Version bump to 0.2.0.
+
 ## [0.1.1] - 2026-10-11
 
 ### Added

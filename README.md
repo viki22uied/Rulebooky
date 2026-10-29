@@ -64,7 +64,7 @@ The skill (`SKILL.md`) tells Claude to read your rules and write them into
 | `PostToolUse` | `track.py` | Count tool calls |
 | `Stop` | `audit.py` | Stop Claude if work is open |
 
-In this guide, `RL` means `python3 .claude/rulebooky/rulebooky.py`.
+In this guide, `RL` means `python .claude/rulebooky/rulebooky.py`.
 
 ## 3. Quickstart
 
@@ -84,8 +84,8 @@ Do these steps:
 2. Install the hooks into your project:
    ```bash
    cd your-project
-   python3 ~/.claude/skills/rulebooky/scripts/rulebooky.py install
-   python3 .claude/rulebooky/rulebooky.py doctor
+   python ~/.claude/skills/rulebooky/scripts/rulebooky.py install
+   python .claude/rulebooky/rulebooky.py doctor
    ```
    The `doctor` command checks all parts. Fix each FAIL line it shows.
    Install picks a working Python 3 by itself. To force one, add
@@ -100,7 +100,7 @@ of your settings at `.claude/settings.json.rulebooky.bak`.
 To remove the hooks from a project, run:
 
 ```bash
-python3 .claude/rulebooky/rulebooky.py uninstall
+python .claude/rulebooky/rulebooky.py uninstall
 ```
 
 This keeps your `rules.json`. Add `--purge` to also delete scripts and state.
@@ -110,28 +110,92 @@ This keeps your `rules.json`. Add `--purge` to also delete scripts and state.
 Claude runs these commands. You can also run them by hand. You can run them
 from any folder in the project.
 
+### New: Rule Discovery
+
+Scan existing rule files (CLAUDE.md, .cursorrules, AGENTS.md, etc.) and auto-generate checkable rules:
+
+```bash
+python .claude/rulebooky/rulebooky.py discover          # preview
+python .claude/rulebooky/rulebooky.py discover --apply  # add to rules.json
+```
+
+### New: Rule Test Sandbox
+
+Dry-run rules against sample inputs before committing:
+
+```bash
+python .claude/rulebooky/rulebooky.py test --scenario test-scenario.json
+```
+
+Scenario file format:
+
+```json
+{
+  "tests": [
+    {"tool": "Bash", "input": {"command": "git push --force"}, "expected": "blocked"},
+    {"tool": "Write", "input": {"file_path": "test.md"}, "expected": "blocked"}
+  ]
+}
+```
+
+### New: Observability Log
+
+View blocked/allowed actions and stop blocks:
+
+```bash
+python .claude/rulebooky/rulebooky.py log                    # recent table
+python .claude/rulebooky/rulebooky.py log --since 7d        # last 7 days
+python .claude/rulebooky/rulebooky.py log --format summary  # blocks by rule
+python .claude/rulebooky/rulebooky.py log --format json     # raw JSON
+```
+
+### New: Rule History & Blame
+
+Track every rules.json change:
+
+```bash
+python .claude/rulebooky/rulebooky.py history               # full history
+python .claude/rulebooky/rulebooky.py history no-md-sprawl  # blame one rule
+```
+
+### New: Team Sync (GitHub Gist)
+
+Share rules across a team with CI validation:
+
+```bash
+python .claude/rulebooky/rulebooky.py sync push             # push to gist
+python .claude/rulebooky/rulebooky.py sync pull             # pull from gist
+python .claude/rulebooky/rulebooky.py sync ci               # CI gate (exit 1 if diverged)
+```
+
+Requires GitHub CLI (`gh`).
+
+### New: Subagent Auto-Propagation
+
+Subagents automatically receive the current rules and task card. No manual copy needed.
+
 1. Open a task card before large work:
    ```bash
-   python3 .claude/rulebooky/rulebooky.py task set \
+   python .claude/rulebooky/rulebooky.py task set \
      --goal "Port auth to the API in spec.pdf" \
      --method "follow spec sections in order" \
      --forbid "scrape\.py" --min WebSearch=5
    ```
 2. Add one requirement for each item in your document:
    ```bash
-   python3 .claude/rulebooky/rulebooky.py task add-req "Spec 3.2: tokens expire after 15 min"
+   python .claude/rulebooky/rulebooky.py task add-req "Spec 3.2: tokens expire after 15 min"
    ```
 3. Save each decision:
    ```bash
-   python3 .claude/rulebooky/rulebooky.py decide "chose JWT per spec 3.1"
+   python .claude/rulebooky/rulebooky.py decide "chose JWT per spec 3.1"
    ```
 4. Close each requirement with proof (file and line, command result, or URL):
    ```bash
-   python3 .claude/rulebooky/rulebooky.py task done 1 --evidence "auth/token.py:41"
+   python .claude/rulebooky/rulebooky.py task done 1 --evidence "auth/token.py:41"
    ```
 5. Close the task when all work is done:
    ```bash
-   python3 .claude/rulebooky/rulebooky.py task close
+   python .claude/rulebooky/rulebooky.py task close
    ```
 
 If a hook stops you, the `BLOCKED` message is a rule. It is not a bug. Use a
@@ -183,7 +247,7 @@ tests/run_tests.py          full test suite
 Run this command:
 
 ```bash
-python3 tests/run_tests.py
+python tests/run_tests.py
 ```
 
 The suite builds a test project. It sends fake hook events. It checks stops,
@@ -198,7 +262,7 @@ runs it on Ubuntu, macOS, and Windows. Result must be `40 passed, 0 failed`.
 | Hooks do not run | Run `RL doctor` first. Fix each FAIL line. Restart Claude Code. Run `/hooks`. Find five rulebooky entries. |
 | `lint` shows errors | Read `references/rules-schema.md`. Fix tier and `check` type. |
 | `audit` stops each time | Run `task done N --evidence "..."` for each item. Meet `min_calls`. |
-| `python3` is not found (Windows) | Run `install` again with `--python python`. The hooks will use it. |
+| `python` not found | Run `install` again with `--python python`. The hooks will use it. |
 | Install says `not valid JSON` | Fix `.claude/settings.json` by hand. Rulebooky never overwrites it. Run `install` again. |
 | Command prints `rulebooky: ...` | Read the message. Fix the named item. Run the command again. No hidden fault. |
 | Strange acts after hook change | Run `install` again. Restart Claude Code. Read `hook-errors.log`. |
