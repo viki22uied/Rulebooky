@@ -113,13 +113,13 @@ def log_action(event_type, tool_name, tool_input, result, rule_id=None, rule_tex
         p.parent.mkdir(parents=True, exist_ok=True)
         entry = {
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "type": event_type,  # "blocked", "allowed", "stop_block", "task_set", "task_done", "task_close"
+            "type": event_type,
             "tool": tool_name,
             "input": tool_input,
-            "result": result,  # "blocked" | "allowed" | "stop_blocked"
+            "result": result,
             "rule_id": rule_id,
             "rule_text": rule_text,
-            "task_goal": (C.load_state().get("task") or {}).get("goal", "") if event_type in ("blocked", "allowed") else ""
+            "task_goal": (load_state().get("task") or {}).get("goal", "") if event_type in ("blocked", "allowed") else ""
         }
         with open(str(p), "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")

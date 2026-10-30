@@ -1,9 +1,39 @@
 #!/usr/bin/env python3
 """Stop: refuse to let Claude finish while an open task has unmet checks (exit 2)."""
+import importlib
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import *  # noqa
+
+_common_mod = None
+
+
+def _C():
+    global _common_mod
+    if _common_mod is not None:
+        return _common_mod
+    try:
+        _common_mod = importlib.import_module("common")
+        return _common_mod
+    except Exception as e:
+        try:
+            import time
+            p = os.path.dirname(os.path.abspath(__file__))
+            p = os.path.join(p, "..", "hook-errors.log")
+            p = os.path.abspath(p)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "a", encoding="utf-8") as f:
+                f.write("%s audit import: %r\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), e))
+        except Exception:
+            pass
+        return None
+
+
+def _call(name, *args, **kwargs):
+    c = _C()
+    if c is None:
+        return None
+    return getattr(c, name)(*args, **kwargs)
 
 
 def problems_for(rules, state):
@@ -11,35 +41,40 @@ def problems_for(rules, state):
     if not task:
         return []
     probs = []
-    for tool, n in min_calls_required(rules, state).items():
+    # Use _call to get min_calls_required from common
+    need = _call("min_calls_required", rules, state) or {}
+    for tool, n in need.items():
         have = state["counters"].get(tool, 0)
         if have < n:
             probs.append("%s used %d/%d times (required for this task)" % (tool, have, n))
-    for i, r in open_reqs(task):
+    open_reqs_result = _call("open_reqs", task) or []
+    for i, r in open_reqs_result:
         probs.append("Requirement %d not done with evidence: %s" % (i, r["text"]))
     return probs
 
 
 def main():
-    setup_io()
-    read_event()
-    rules, state = load_rules(), load_state()
+    c = _C()
+    if c is None:
+        sys.exit(0)
+    c.setup_io()
+    c.read_event()
+    rules, state = c.load_rules(), c.load_state()
     probs = problems_for(rules, state)
     if not probs:
         if state.get("stop_blocks"):
             state["stop_blocks"] = 0
-            save_state(state)
+            c.save_state(state)
         return
     limit = int(rules.get("max_stop_blocks", 3))
     if state.get("stop_blocks", 0) >= limit:
-        # escape hatch so a bad task card cannot trap the session forever
-        log_action("stop_block", "Stop", {}, "escape_hatch", "max_stop_blocks", 
-                   f"Allowed after {limit} blocks: {'; '.join(probs)}")
+        _call("log_action", "stop_block", "Stop", {}, "escape_hatch", "max_stop_blocks", 
+               f"Allowed after {limit} blocks: {'; '.join(probs)}")
         sys.stderr.write("rulebooky: stop allowed after %d blocks, UNMET: %s\n" % (limit, "; ".join(probs)))
         return
     state["stop_blocks"] = state.get("stop_blocks", 0) + 1
-    save_state(state)
-    log_action("stop_block", "Stop", {}, "blocked", "audit", "; ".join(probs))
+    c.save_state(state)
+    _call("log_action", "stop_block", "Stop", {}, "blocked", "audit", "; ".join(probs))
     sys.stderr.write("Do not finish yet. Unmet:\n- " + "\n- ".join(probs) +
                      "\nDo the work, then mark requirements with: "
                      "python3 .claude/rulebooky/rulebooky.py task done N --evidence \"...\" "
@@ -53,5 +88,5 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:
-        log_error("audit: %r" % e)
+        _call("log_error", "audit: %r" % e)
     sys.exit(0)
