@@ -294,4 +294,5 @@ runs it on Ubuntu, macOS, and Windows. Result must be `40 passed, 0 failed`.
 
 MIT. See [LICENSE](LICENSE).
 #   C I   t r i g g e r  
+ #   C I   r e t r y  
  
