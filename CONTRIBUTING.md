@@ -22,7 +22,7 @@ Do these steps:
    ```
 2. Run the tests:
    ```bash
-   python3 tests/run_tests.py
+   python tests/run_tests.py && python tests/stress_test.py
    ```
 
 No install step is necessary. No virtualenv is necessary.
@@ -38,7 +38,7 @@ No install step is necessary. No virtualenv is necessary.
    your fix. It must pass with your fix.
 4. Run the full suite:
    ```bash
-   python3 tests/run_tests.py
+   python tests/run_tests.py && python tests/stress_test.py
    ```
    All tests must pass.
 5. If you change rule parsing, check `lint` output in the suite.
@@ -56,7 +56,7 @@ No install step is necessary. No virtualenv is necessary.
 
 Open an issue. Include these items:
 
-- Python version (`python3 --version`) and OS.
+- Python version (`python --version`) and OS.
 - Claude Code version and `/hooks` output.
 - Smallest `rules.json` that shows the fault.
 - Fake hook event JSON that shows the fault, if you have it.

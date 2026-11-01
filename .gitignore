@@ -8,7 +8,11 @@ venv/
 
 # rulebooky runtime state (per-project, never commit)
 .claude/rulebooky/state.json
-.claude/rulebooky/hook-errors.log
+.claude/rulebooky/state.lock
+.claude/rulebooky/hook-errors.log*
+.claude/rulebooky/actions.log*
+.claude/rulebooky/rules-history.jsonl*
+.claude/rulebooky/*.tmp
 
 # OS / editors
 .DS_Store
