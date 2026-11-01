@@ -15,14 +15,19 @@ CLI: `python .claude/rulebooky/rulebooky.py <cmd>` (call it `RL` below).
 
 ## 1. First-time setup
 1. Run `python <this-skill-dir>/scripts/rulebooky.py install` in the project root.
-2. Collect the user's rules (they may paste messy docs, CLAUDE.md files, chat history). Merge everything into `rules.json`. Do not copy the source files.
+2. Collect the user's rules (they may paste messy docs, CLAUDE.md files, chat history). Merge everything into `rules.json` with `RL rule add` (below). Do not copy the source files. Do not edit `rules.json` with Write/Edit: Claude Code treats `.claude/` as sensitive and will refuse or prompt.
+   - `RL rule add ID --tier hard --text "..." --deny-bash REGEX` (or `--deny-path REGEX`, or `--block-new GLOB [--allow NAME]...`)
+   - `RL rule add ID --tier process --text "..." [--min TOOL=N]`
+   - `RL rule add ID --tier soft --text "..."`
+   - `RL rule list`, `RL rule remove ID`, `--replace` to change one. Each command validates and lints.
 3. Classify each rule. Be strict about tiers:
    - **hard**: a tool call can be detected and blocked. Needs a `check` (see `references/rules-schema.md`). Examples: no new .md files, no force push, never touch `migrations/`.
    - **process**: a checkable step. Only `min_calls` (tool + count) is automatable, e.g. WebSearch at least 3. Other process rules are workflow text that point at the task card.
    - **soft**: style/behaviour that cannot be checked (tone, format). Max 10.
 4. If a rule cannot be made hard, tell the user plainly it is advisory. Do not pretend it is enforced.
 5. Keep rules short, imperative, testable. Max 25 total. Merge duplicates, drop vague ones ("follow best practices").
-6. Run `RL doctor`, fix every FAIL line, then tell the user to restart Claude Code so hooks load. If anything misbehaves later, run `RL doctor` first.
+6. Check each hard rule blocks what it should and nothing else: `RL test --tool Bash --input '{"command": "..."}'`, or put several cases in a scenario file and run `RL test --scenario FILE` (exits 1 on a mismatch). A single plain `RL ...` call is never blocked for quoting a forbidden command in its text; chained commands are.
+7. Run `RL doctor`, fix every FAIL line, then tell the user to restart Claude Code so hooks load. If anything misbehaves later, run `RL doctor` first. (The install step is needed because a skill alone cannot block anything; the hooks live in `.claude/settings.json` so they run in every session.)
 
 ## 2. Every non-trivial task
 1. Before doing anything else: `RL task set --goal "..." --method "..." [--forbid REGEX]... [--min WebSearch=N] [--done-when "..."]`.
@@ -39,20 +44,17 @@ CLI: `python .claude/rulebooky/rulebooky.py <cmd>` (call it `RL` below).
 - A Stop block lists what is unmet. Do that work, then stop. If the user dropped it, tell them and use `RL task close --force`.
 
 ## 4. Subagents
-Subagents do not inherit this conversation. Paste the output of `RL brief` at the top of every subagent prompt, and require them to report evidence per requirement.
+Subagents do not inherit this conversation. The `SubagentStart` hook gives every subagent the rules and the task card, and hard rules also block the subagent's own tool calls. Still require each subagent to report evidence per requirement. On a Claude Code version without `SubagentStart` (`RL doctor` shows it), paste the output of `RL brief` at the top of the subagent prompt.
 
 ## 5. Changing rules
-Edit only `rules.json`, then `RL lint`. When the user corrects you, turn the correction into one new checkable rule (hard if detectable), not a paragraph. Never write rules into new .md files.
+Change rules only with `RL rule add|remove` (it lints for you). When the user corrects you, turn the correction into one new checkable rule (hard if detectable), not a paragraph. Never write rules into new .md files.
 
-## 6. New commands (v0.2+)
-
-- `RL discover` — scan CLAUDE.md, .cursorrules, AGENTS.md for rules. `--apply` adds them.
-- `RL test --scenario FILE` — dry-run rules against test cases. No hooks triggered.
-- `RL log [--since 7d] [--type blocked] [--format summary]` — view enforcement history.
-- `RL history [rule-id]` — audit trail of rules.json changes. Blame one rule.
-- `RL sync push|pull|ci` — share rules via GitHub Gist. `ci` fails if local != remote.
-
-Subagents now auto-receive rules + task card via Task tool. No manual `RL brief` paste needed.
+## 6. More commands
+- `RL discover` — scan CLAUDE.md, .cursorrules, AGENTS.md for rules. `--apply` adds them. Review what it adds; the patterns are heuristics.
+- `RL test --scenario FILE` (or `--tool Bash --input '{"command":"..."}'`) — dry-run rules. Exits 1 if a case does not match `expected`. Use it after every rule change.
+- `RL log [--since 7d] [--type blocked] [--format summary]` — enforcement history.
+- `RL history [rule-id]` — rules.json change history; with an id, when it was added/removed.
+- `RL sync push|pull|ci` — share rules via a GitHub Gist (needs `gh`). `ci` exits 1 if local != remote.
 
 ## Limits to state honestly
 Hooks cannot judge quality or method. They enforce what a tool call, a count, or a checklist can show. Bash can bypass file-path rules, so add `deny_bash` patterns for the risky commands.

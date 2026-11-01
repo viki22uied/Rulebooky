@@ -677,20 +677,318 @@ def test_invalid_process_check():
 
 
 def test_subagent_auto_propagation():
-    """Task tool call gets rules injected."""
+    """SubagentStart hook hands the subagent the rules + task card as additionalContext."""
     with tempfile.TemporaryDirectory() as d:
         proj = Path(d)
         setup_project(proj)
         cli(proj, "task", "set", "--goal", "parent task")
         cli(proj, "task", "add-req", "Parent requirement")
-        # Simulate Task tool call
-        r = run(proj, "hooks/guard.py", {
-            "tool_name": "Task",
-            "tool_input": {"prompt": "Do something", "subagent_type": "general-purpose"}
-        })
-        check("Task tool allowed", r.returncode == 0)
-        # The prompt should be modified by guard.py (we can't easily test the modified prompt
-        # since guard.py doesn't return it, but we can verify no crash)
+        r = run(proj, "hooks/inject.py", {"hook_event_name": "SubagentStart", "agent_id": "a1",
+                                          "agent_type": "general-purpose"}, args=["subagent"])
+        try:
+            out = json.loads(r.stdout)["hookSpecificOutput"]
+        except Exception:
+            out = {}
+        check("SubagentStart emits JSON additionalContext", r.returncode == 0
+              and out.get("hookEventName") == "SubagentStart")
+        ctx = out.get("additionalContext", "")
+        check("subagent context has rules + task card", "[RULEBOOKY]" in ctx and "parent task" in ctx
+              and "Parent requirement" in ctx)
+        r = run(proj, "hooks/guard.py", {"tool_name": "Agent",
+                                         "tool_input": {"prompt": "Do something", "subagent_type": "Explore"}})
+        check("Agent tool allowed by guard", r.returncode == 0)
+        err = proj / ".claude/rulebooky/hook-errors.log"
+        check("Agent tool call logs no hook error", not err.exists() or not err.read_text().strip())
+
+
+def test_bad_rule_does_not_disable_others():
+    """One broken regex must not switch off every other rule (used to fail open entirely)."""
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        setup_project(proj)
+        rp = proj / ".claude/rulebooky/rules.json"
+        rules = json.loads(rp.read_text())
+        rules["rules"].insert(0, {"id": "broken", "tier": "hard", "text": "x",
+                                  "check": {"type": "deny_bash", "pattern": "(unclosed"}})
+        rules["rules"].insert(0, {"id": "nocheck-type", "tier": "hard", "text": "y", "check": {}})
+        rules["rules"].append("not an object")
+        rp.write_text(json.dumps(rules))
+        r = run(proj, "hooks/guard.py", {"tool_name": "Bash", "tool_input": {"command": "git push --force"}})
+        check("other hard rules still enforced next to a bad regex", r.returncode == 2 and "no-force-push" in r.stderr)
+        err = (proj / ".claude/rulebooky/hook-errors.log").read_text()
+        check("bad regex logged", "broken" in err)
+        r = cli(proj, "lint")
+        check("lint reports non-object rule entry", r.returncode == 1 and "not an object" in r.stdout)
+        rp.write_text(json.dumps({"rules": [{"id": "p", "tier": "process", "text": "t",
+                                             "check": {"type": "min_calls", "tool": "WebSearch", "n": "x"}}]}))
+        cli(proj, "task", "set", "--goal", "g", "--min", "Read=1")
+        r = run(proj, "hooks/audit.py")
+        check("bad min_calls rule skipped, task --min still enforced", r.returncode == 2 and "Read used 0/1" in r.stderr)
+
+
+def test_rules_json_wrong_shape():
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        setup_project(proj)
+        rp = proj / ".claude/rulebooky/rules.json"
+        for bad in ("[]", '{"rules": {}}', '{"rules": [], "max_stop_blocks": "many"}', '"str"'):
+            rp.write_text(bad)
+            r = cli(proj, "lint")
+            ok = r.returncode == 1 and "Traceback" not in r.stderr
+            g = run(proj, "hooks/guard.py", {"tool_name": "Bash", "tool_input": {"command": "ls"}})
+            a = run(proj, "hooks/audit.py")
+            i = run(proj, "hooks/inject.py", args=["session"])
+            check("wrong-shaped rules.json %s: lint errors, hooks survive" % bad,
+                  ok and g.returncode == 0 and a.returncode == 0 and i.returncode == 0)
+
+
+def test_tool_input_not_object():
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        setup_project(proj)
+        for ti in ("a string", ["list"], 5):
+            r = run(proj, "hooks/guard.py", {"tool_name": "Bash", "tool_input": ti})
+            check("guard survives tool_input=%r" % (ti,), r.returncode == 0)
+        r = run(proj, "hooks/guard.py", {"tool_name": "Bash", "tool_input": {"command": None}})
+        check("guard survives command=null", r.returncode == 0)
+
+
+def test_uppercase_md_extension():
+    """NOTES.MD must not slip past a *.md rule on case-sensitive file systems."""
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        setup_project(proj)
+        r = run(proj, "hooks/guard.py", {"tool_name": "Write", "tool_input": {"file_path": str(proj / "NOTES.MD")}})
+        check("uppercase .MD blocked", r.returncode == 2)
+
+
+def test_log_since_and_safety():
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        setup_project(proj)
+        secret = "SECRET-" + "z" * 5000
+        run(proj, "hooks/guard.py", {"tool_name": "Write",
+                                     "tool_input": {"file_path": str(proj / "a.py"), "content": secret}})
+        run(proj, "hooks/guard.py", {"tool_name": "Bash", "tool_input": {"command": "git push --force"}})
+        log = (proj / ".claude/rulebooky/actions.log").read_text()
+        check("actions.log never stores file contents", "SECRET-" not in log)
+        r = cli(proj, "log", "--since", "7d")
+        check("log --since 7d works", r.returncode == 0 and "Blocked: 1" in r.stdout and "Traceback" not in r.stderr)
+        r = cli(proj, "log", "--since", "soon")
+        check("log --since bad value: friendly error", r.returncode == 1 and "Traceback" not in r.stderr)
+        r = cli(proj, "log", "--type", "allowed")
+        check("log table prints allowed rows", r.returncode == 0 and "ALLOWED" in r.stdout)
+
+
+def test_log_rotation():
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        setup_project(proj)
+        lp = proj / ".claude/rulebooky/actions.log"
+        lp.write_text("x" * 1100000)
+        run(proj, "hooks/guard.py", {"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        check("actions.log rotates past 1 MB", lp.stat().st_size < 10000
+              and (proj / ".claude/rulebooky/actions.log.1").exists())
+
+
+def test_history_diff_and_blame():
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        setup_project(proj)
+        hp = proj / ".claude/rulebooky/rules-history.jsonl"
+        rows = [{"ts": "2026-01-01 00:00:00", "rules_count": 1, "rule_ids": ["a"]},
+                {"ts": "2026-01-02 00:00:00", "rules_count": 2, "rule_ids": ["a", "b"]},
+                {"ts": "2026-01-03 00:00:00", "rules_count": 1, "rule_ids": ["a"]},
+                {"ts": "2026-01-04 00:00:00", "rules_count": 1, "rule_ids": ["a"]}]
+        hp.write_text("\n".join(json.dumps(x) for x in rows) + "\n")
+        out = cli(proj, "history").stdout
+        check("history shows add/remove/edit", "init 1" in out and "+b" in out and "-b" in out and "same ids" in out)
+        out = cli(proj, "history", "b").stdout
+        check("blame shows added and removed", "added  b" in out and "removed  b" in out)
+
+
+def test_subagent_hook_registered():
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        setup_project(proj)
+        s = json.loads((proj / ".claude/settings.json").read_text())
+        check("SubagentStart registered", any(h["command"].endswith("inject.py\" subagent")
+              for e in s["hooks"].get("SubagentStart", []) for h in e["hooks"]))
+        r = cli(proj, "doctor")
+        check("doctor checks SubagentStart", "SubagentStart hook registered" in r.stdout and r.returncode == 0)
+
+
+def test_doctor_quoted_interpreter():
+    """Doctor must read an interpreter path with spaces (Windows "C:\\Program Files\\...")."""
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        spaced = base / "py dir"
+        spaced.mkdir()
+        link = spaced / "python"
+        try:
+            os.symlink(PY, str(link))
+        except (OSError, NotImplementedError, AttributeError):
+            check("doctor reads quoted interpreter (skipped: no symlinks)", True)
+            return
+        proj = base / "proj"
+        proj.mkdir()
+        (proj / ".claude").mkdir()
+        r = subprocess.run([PY, str(ROOT / "scripts/rulebooky.py"), "install", "--project", str(proj),
+                            "--python", '"%s"' % link], capture_output=True, text=True)
+        if r.returncode != 0:  # --python rejects the quoted form; write the quoted command ourselves
+            subprocess.run([PY, str(ROOT / "scripts/rulebooky.py"), "install", "--project", str(proj)],
+                           capture_output=True, check=True)
+            sp = proj / ".claude/settings.json"
+            s = json.loads(sp.read_text())
+            for entries in s["hooks"].values():
+                for e in entries:
+                    for h in e["hooks"]:
+                        if "rulebooky/hooks/" in h["command"]:
+                            h["command"] = '"%s" %s' % (link, h["command"].split(" ", 1)[1])
+            sp.write_text(json.dumps(s))
+        r = cli(proj, "doctor")
+        check("doctor reads quoted interpreter with spaces", r.returncode == 0 and "py dir" in r.stdout)
+
+
+def test_discover_prunes_and_curly_quotes():
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        setup_project(proj)
+        (proj / "CLAUDE.md").write_text("Don\u2019t run git push with --force\n", encoding="utf-8")
+        nm = proj / "node_modules" / "pkg"
+        nm.mkdir(parents=True)
+        (nm / "CLAUDE.md").write_text("don't install packages without asking\n")
+        r = cli(proj, "discover")
+        check("discover matches curly apostrophe", "no-force-push" in r.stdout)
+        check("discover skips node_modules", "no-deps-without-ask" not in r.stdout)
+
+
+def test_uninstall_purge_runtime_files():
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        setup_project(proj)
+        run(proj, "hooks/guard.py", {"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        cli(proj, "task", "set", "--goal", "g")
+        cli(proj, "uninstall", "--purge")
+        left = sorted(p.name for p in (proj / ".claude/rulebooky").iterdir())
+        check("purge leaves only rules.json", left == ["rules.json"])
+
+
+def test_registered_commands_run_through_shell():
+    """Regression: the mode argument was inside the quotes ("inject.py prompt"), so the real
+    UserPromptSubmit hook exited 2 and blocked every prompt. Run commands as Claude Code does."""
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        setup_project(proj)
+        s = json.loads((proj / ".claude/settings.json").read_text())
+        cmds = {ev: h["command"] for ev, es in s["hooks"].items() for e in es for h in e["hooks"]}
+        check("mode argument outside the quotes", cmds["UserPromptSubmit"].endswith('inject.py" prompt')
+              and cmds["SessionStart"].endswith('inject.py" session'))
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import rulebooky  # noqa: E402  (same shell lookup the doctor uses)
+        shell = rulebooky.hook_shell()
+        if shell:
+            env = dict(os.environ, CLAUDE_PROJECT_DIR=str(proj))
+            r = subprocess.run(shell + [cmds["UserPromptSubmit"]], input="{}", capture_output=True, text=True,
+                               encoding="utf-8", env=env, cwd=str(proj))
+            check("real UserPromptSubmit command exits 0 with rules", r.returncode == 0 and "[RULEBOOKY]" in r.stdout)
+        # doctor must catch the old broken form
+        for es in s["hooks"].values():
+            for e in es:
+                for h in e["hooks"]:
+                    if h["command"].endswith('" prompt'):
+                        h["command"] = h["command"][:-len('" prompt')] + ' prompt"'
+        (proj / ".claude/settings.json").write_text(json.dumps(s))
+        if shell:
+            r = cli(proj, "doctor")
+            check("doctor FAILs on broken hook command", r.returncode == 1
+                  and "FAIL  UserPromptSubmit hook command runs" in r.stdout)
+
+
+def test_rule_cli():
+    """rule add/remove/list: Claude Code blocks direct Write/Edit of .claude/ files."""
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        setup_project(proj)
+        r = cli(proj, "rule", "add", "no-rm-rf", "--tier", "hard", "--text", "Never run rm -rf.",
+                "--deny-bash", r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f")
+        check("rule add hard works", r.returncode == 0 and "Added rule no-rm-rf" in r.stdout)
+        g = run(proj, "hooks/guard.py", {"tool_name": "Bash", "tool_input": {"command": "rm -rf build"}})
+        check("added rule is enforced", g.returncode == 2 and "no-rm-rf" in g.stderr)
+        check("duplicate id refused", cli(proj, "rule", "add", "no-rm-rf", "--tier", "soft", "--text", "x").returncode == 1)
+        check("--replace overwrites", cli(proj, "rule", "add", "no-rm-rf", "--tier", "soft", "--text", "x",
+                                          "--replace").returncode == 0)
+        g = run(proj, "hooks/guard.py", {"tool_name": "Bash", "tool_input": {"command": "rm -rf build"}})
+        check("replaced rule no longer blocks", g.returncode == 0)
+        for args, why in ((["bad", "--tier", "hard", "--text", "x"], "hard without check"),
+                          (["bad", "--tier", "hard", "--text", "x", "--deny-bash", "("], "bad regex"),
+                          (["bad", "--tier", "soft", "--text", "x", "--deny-path", "a"], "soft with check"),
+                          (["bad", "--tier", "process", "--text", "x", "--min", "Web"], "bad --min"),
+                          (["bad id", "--tier", "soft", "--text", "x"], "bad id"),
+                          (["bad", "--tier", "soft", "--text", " "], "empty text")):
+            r = cli(proj, "rule", "add", *args)
+            check("rule add refuses %s" % why, r.returncode == 1 and "Traceback" not in r.stderr)
+        r = cli(proj, "rule", "add", "md", "--tier", "hard", "--text", "No new txt.", "--block-new", "*.txt",
+                "--allow", "keep.txt")
+        check("rule add block-new works", r.returncode == 0)
+        g = run(proj, "hooks/guard.py", {"tool_name": "Write", "tool_input": {"file_path": str(proj / "a.txt")}})
+        g2 = run(proj, "hooks/guard.py", {"tool_name": "Write", "tool_input": {"file_path": str(proj / "keep.txt")}})
+        check("block-new + allow enforced", g.returncode == 2 and g2.returncode == 0)
+        cli(proj, "rule", "add", "r", "--tier", "process", "--text", "Search.", "--min", "WebSearch=2")
+        cli(proj, "task", "set", "--goal", "g")
+        check("process rule from CLI enforced at Stop", "WebSearch used 0/2" in run(proj, "hooks/audit.py").stderr)
+        check("rule list shows rules", "no-rm-rf" in cli(proj, "rule", "list").stdout)
+        check("rule remove works", cli(proj, "rule", "remove", "r").returncode == 0
+              and "r " not in cli(proj, "rule", "list").stdout.split("\n")[-2][:2])
+        check("rule remove unknown: friendly", cli(proj, "rule", "remove", "nope").returncode == 1)
+        check("lint clean after CLI edits", cli(proj, "lint").returncode == 0)
+        (proj / ".claude/rulebooky/rules.json").write_text("{bad")
+        r = cli(proj, "rule", "add", "z", "--tier", "soft", "--text", "z")
+        check("rule add refuses to overwrite corrupt rules.json", r.returncode == 1
+              and (proj / ".claude/rulebooky/rules.json").read_text() == "{bad")
+
+
+def test_own_cli_not_blocked_by_its_rules():
+    """Evidence / rule text that quotes a forbidden command must not be blocked,
+    but chaining a real forbidden command onto a CLI call must be."""
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        setup_project(proj)
+        cli(proj, "rule", "add", "no-rm-rf", "--tier", "hard", "--text", "Never run rm -rf.", "--deny-bash", r"rm\s+-rf")
+        cli(proj, "task", "set", "--goal", "g", "--forbid", "secret-dir")
+        rl = "python .claude/rulebooky/rulebooky.py"
+        allowed = [rl + ' task done 1 --evidence "removed the rm -rf call in build.sh:3"',
+                   rl + " task add-req 'never touch secret-dir'",
+                   'python3 "$CLAUDE_PROJECT_DIR/.claude/rulebooky/rulebooky.py" decide "no rm -rf"',
+                   rl + ' rule add x --tier hard --text "No rm -rf" --deny-bash "rm\\s+-rf"',
+                   rl + ' test --tool Bash --input \'{"command": "rm -rf /"}\'']
+        for c in allowed:
+            r = run(proj, "hooks/guard.py", {"tool_name": "Bash", "tool_input": {"command": c}})
+            check("own CLI allowed: %s" % c[:60], r.returncode == 0)
+        blocked = [rl + ' task done 1 --evidence x; rm -rf /',
+                   rl + ' task done 1 --evidence x && rm -rf /',
+                   rl + ' status | rm -rf /',
+                   rl + ' task done 1 --evidence "$(rm -rf /)"',
+                   rl + ' task done 1 --evidence `rm -rf /`',
+                   rl + ' task done 1 --evidence x\nrm -rf /',
+                   rl + ' uninstall --purge # rm -rf',
+                   rl + ' rule remove no-rm-rf # rm -rf',
+                   'bash -c "rm -rf /" .claude/rulebooky/rulebooky.py task',
+                   'python evil.py .claude/rulebooky/rulebooky.py task "rm -rf"',
+                   'cat secret-dir/x']
+        for c in blocked:
+            r = run(proj, "hooks/guard.py", {"tool_name": "Bash", "tool_input": {"command": c}})
+            check("still blocked: %s" % c[:60].replace("\n", "\\n"), r.returncode == 2)
+
+
+def test_gitignore_runtime_logs():
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        setup_project(proj)
+        setup_project(proj)
+        gi = (proj / ".gitignore").read_text()
+        check("gitignore covers actions.log", ".claude/rulebooky/actions.log*" in gi)
+        check("gitignore entries not duplicated", gi.count("state.json") == 1)
 
 
 def test_log_command():
@@ -778,7 +1076,12 @@ def test_test_command_scenario():
         scenario_path = proj / "test-scenario.json"
         scenario_path.write_text(json.dumps(scenario))
         r = cli(proj, "test", "--scenario", str(scenario_path))
-        check("test --scenario works", r.returncode == 0 and "✓" in r.stdout)
+        check("test --scenario works", r.returncode == 0 and "2/2 scenario test(s) matched" in r.stdout)
+        scenario["tests"].append({"tool": "Bash", "input": {"command": "ls"}, "expected": "blocked"})
+        scenario_path.write_text(json.dumps(scenario))
+        r = cli(proj, "test", "--scenario", str(scenario_path))
+        check("test --scenario exits 1 on mismatch", r.returncode == 1 and "FAIL" in r.stdout
+              and "Traceback" not in r.stderr)
 
 
 def test_sync_no_gh():
@@ -856,6 +1159,29 @@ def test_concurrent_hook_calls():
             run(proj, "hooks/guard.py", {"tool_name": "Bash", "tool_input": {"command": "ls"}})
         r = run(proj, "hooks/audit.py")
         check("concurrent calls don't corrupt", r.returncode in (0, 2))
+
+
+def test_parallel_track_counts_exact():
+    """Claude Code runs tool calls in parallel; no PostToolUse increment may be lost."""
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        setup_project(proj)
+        cli(proj, "task", "set", "--goal", "parallel", "--min", "WebSearch=30")
+        env = dict(os.environ, CLAUDE_PROJECT_DIR=str(proj))
+        procs = [subprocess.Popen([PY, str(proj / ".claude/rulebooky/hooks/track.py")], stdin=subprocess.PIPE,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, cwd=str(proj))
+                 for _ in range(30)]
+        for pr in procs:
+            pr.stdin.write(b'{"tool_name": "WebSearch"}')
+            pr.stdin.close()
+        for pr in procs:
+            pr.wait()
+        st = json.loads((proj / ".claude/rulebooky/state.json").read_text())
+        check("30 parallel track calls counted exactly (got %s)" % st["counters"].get("WebSearch"),
+              st["counters"].get("WebSearch") == 30)
+        check("audit passes after 30 parallel searches", run(proj, "hooks/audit.py").returncode == 0)
+        left = list((proj / ".claude/rulebooky").glob("*.tmp"))
+        check("no leftover tmp files", not left)
 
 
 def test_gitignore_updated():
@@ -1048,6 +1374,22 @@ if __name__ == "__main__":
     # Hook registration
     test_all_hook_events_registered()
     test_hook_matcher_correct()
+    test_bad_rule_does_not_disable_others()
+    test_rules_json_wrong_shape()
+    test_tool_input_not_object()
+    test_uppercase_md_extension()
+    test_log_since_and_safety()
+    test_log_rotation()
+    test_history_diff_and_blame()
+    test_subagent_hook_registered()
+    test_doctor_quoted_interpreter()
+    test_discover_prunes_and_curly_quotes()
+    test_uninstall_purge_runtime_files()
+    test_gitignore_runtime_logs()
+    test_parallel_track_counts_exact()
+    test_registered_commands_run_through_shell()
+    test_rule_cli()
+    test_own_cli_not_blocked_by_its_rules()
     
     print("=" * 60)
     print(f"RESULTS: {passed} passed, {failed} failed")

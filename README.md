@@ -43,7 +43,7 @@ them. rulebooky moves checks from the prompt into hooks.
 | Claude forgets rules after `/clear` | The `SessionStart` hook shows rules again each time |
 | Claude ignores your document | The task card tracks each requirement with proof |
 | Claude stops after one search | The `min_calls` check requires N searches |
-| Subagents start with no context | The `brief` command gives them the task card |
+| Subagents start with no context | The `SubagentStart` hook gives each subagent the rules and task card |
 | Claude mixes two tasks | One card holds one task only |
 
 ## 2. How it works
@@ -60,6 +60,7 @@ The skill (`SKILL.md`) tells Claude to read your rules and write them into
 | Event | Script | Function |
 |---|---|---|
 | `SessionStart`, `UserPromptSubmit` | `inject.py` | Show rules and task card |
+| `SubagentStart` | `inject.py subagent` | Give each subagent the rules and task card |
 | `PreToolUse` | `guard.py` | Stop violations (exit 2) |
 | `PostToolUse` | `track.py` | Count tool calls |
 | `Stop` | `audit.py` | Stop Claude if work is open |
@@ -69,7 +70,16 @@ In this guide, `RL` means `python .claude/rulebooky/rulebooky.py`.
 ## 3. Quickstart
 
 You need Python 3.8 or newer. You need Claude Code with hook support. On
-Windows, use `python` and not `python3`.
+Windows, use `python` and not `python3`. Claude Code runs hooks with Git Bash
+on Windows, so install Git for Windows.
+
+> **Why an install step?** rulebooky *is* a Claude Code skill (`SKILL.md`).
+> But a skill only teaches Claude. It cannot block anything on its own.
+> Skills can carry hooks in their frontmatter, but those hooks start only
+> after the skill is used in a session. They are gone in the next session,
+> and they do not run on the `SessionStart` that re-shows your rules.
+> `install` writes the hooks into the project's `.claude/settings.json`, so
+> they run in every session, from the first prompt.
 
 Do these steps:
 
@@ -90,7 +100,7 @@ Do these steps:
    The `doctor` command checks all parts. Fix each FAIL line it shows.
    Install picks a working Python 3 by itself. To force one, add
    `--python python` to the install command.
-3. Restart Claude Code. Check `/hooks`. You must see five rulebooky entries.
+3. Restart Claude Code. Check `/hooks`. You must see six rulebooky entries.
 4. Tell Claude: *Use rulebooky. Here are my rules: ...*
 
 To update, run `git -C ~/.claude/skills/rulebooky pull`. Then run `install`
@@ -110,6 +120,26 @@ This keeps your `rules.json`. Add `--purge` to also delete scripts and state.
 Claude runs these commands. You can also run them by hand. You can run them
 from any folder in the project.
 
+### Add and remove rules
+
+Use the CLI, not a text editor. Claude Code treats files in `.claude/` as
+sensitive, so Claude's Write and Edit tools refuse or ask about `rules.json`.
+Each command checks the rule and runs `lint`:
+
+```bash
+python .claude/rulebooky/rulebooky.py rule add no-rm-rf --tier hard \
+  --text "Never run rm -rf." --deny-bash '\brm\s+-[a-zA-Z]*r[a-zA-Z]*f'
+python .claude/rulebooky/rulebooky.py rule add keep-migrations --tier hard \
+  --text "Never edit migrations/." --deny-path '(^|/)migrations/'
+python .claude/rulebooky/rulebooky.py rule add research --tier process \
+  --text "Research needs 5 web searches." --min WebSearch=5
+python .claude/rulebooky/rulebooky.py rule add bullets --tier soft --text "Answer in short bullets."
+python .claude/rulebooky/rulebooky.py rule list
+python .claude/rulebooky/rulebooky.py rule remove bullets
+```
+
+You can still edit `rules.json` by hand. Run `lint` after.
+
 ### New: Rule Discovery
 
 Scan existing rule files (CLAUDE.md, .cursorrules, AGENTS.md, etc.) and auto-generate checkable rules:
@@ -121,10 +151,12 @@ python .claude/rulebooky/rulebooky.py discover --apply  # add to rules.json
 
 ### New: Rule Test Sandbox
 
-Dry-run rules against sample inputs before committing:
+Dry-run rules against sample inputs before committing. The command exits 1
+if any case does not match its `expected` value, so you can use it in CI:
 
 ```bash
 python .claude/rulebooky/rulebooky.py test --scenario test-scenario.json
+python .claude/rulebooky/rulebooky.py test --tool Bash --input '{"command": "git push --force"}'
 ```
 
 Scenario file format:
@@ -140,7 +172,9 @@ Scenario file format:
 
 ### New: Observability Log
 
-View blocked/allowed actions and stop blocks:
+View blocked/allowed actions and stop blocks. The log keeps only the command
+or file path, never file contents. It rotates at about 1 MB. It is not
+committed.
 
 ```bash
 python .claude/rulebooky/rulebooky.py log                    # recent table
@@ -163,16 +197,15 @@ python .claude/rulebooky/rulebooky.py history no-md-sprawl  # blame one rule
 Share rules across a team with CI validation:
 
 ```bash
-python .claude/rulebooky/rulebooky.py sync push             # push to gist
+python .claude/rulebooky/rulebooky.py sync push             # first push creates a secret gist
 python .claude/rulebooky/rulebooky.py sync pull             # pull from gist
 python .claude/rulebooky/rulebooky.py sync ci               # CI gate (exit 1 if diverged)
 ```
 
-Requires GitHub CLI (`gh`).
+Requires GitHub CLI (`gh`, logged in). The first `push` saves `gist_id` in
+`rules.json`. Commit it. Later pushes update that same gist.
 
-### New: Subagent Auto-Propagation
-
-Subagents automatically receive the current rules and task card. No manual copy needed.
+### Task cards
 
 1. Open a task card before large work:
    ```bash
@@ -222,44 +255,66 @@ enforced.
 
 ## 6. Subagents
 
-Subagents do not see this chat. Copy the output of `RL brief` into each
-subagent prompt. Ask each subagent to give proof for each requirement. Note:
-subagent tool calls may not increase parent counters. This is not verified.
-Check counts in the parent session.
+Subagents do not see this chat. The `SubagentStart` hook gives each new
+subagent the rules and the task card as context. You do not need to copy
+anything. Project hooks also run for tool calls that subagents make, so
+hard rules block them too. Ask each subagent to give proof for each
+requirement.
+
+On a Claude Code version without `SubagentStart`, paste the output of
+`RL brief` at the top of the subagent prompt.
 
 ## 7. File layout
 
 ```text
 SKILL.md                    orders that Claude obeys
-scripts/rulebooky.py        CLI: install, doctor, uninstall, lint, task, decide, brief
+scripts/rulebooky.py        CLI: install, doctor, uninstall, lint, task, decide, brief,
+                            discover, test, log, history, sync
 scripts/hooks/common.py     shared functions for paths and JSON
-scripts/hooks/inject.py     shows context at start and each prompt
+scripts/hooks/inject.py     shows context at start, at each prompt, and to subagents
 scripts/hooks/guard.py      stops violations before tool use
 scripts/hooks/track.py      counts tool calls after tool use
 scripts/hooks/audit.py      stops Claude if work is open
 templates/rules.json        start rules
 references/rules-schema.md  rule syntax and examples
-tests/run_tests.py          full test suite
+tests/run_tests.py          end-to-end test suite
+tests/stress_test.py        edge cases, bad input, concurrency, regressions
+```
+
+Files in each project, under `.claude/rulebooky/`:
+
+```text
+rules.json            your rules (commit this)
+state.json            task card and counters      (gitignored)
+state.lock            lock for parallel hooks     (gitignored)
+actions.log           block/allow history         (gitignored)
+rules-history.jsonl   rules.json change history   (gitignored)
+hook-errors.log       hook faults                 (gitignored)
 ```
 
 ## 8. Tests
 
-Run this command:
+Run these commands:
 
 ```bash
 python tests/run_tests.py
+python tests/stress_test.py
 ```
 
-The suite builds a test project. It sends fake hook events. It checks stops,
-allow lists, forbid patterns, search counts, proof rules, install safety,
-uninstall, and fail-open faults. CI runs it on Python 3.8 through 3.12. CI
-runs it on Ubuntu, macOS, and Windows. Result must be `40 passed, 0 failed`.
+The suites build test projects. They send fake hook events. They run the
+exact hook commands from `settings.json` through a shell, as Claude Code
+does. They check stops, allow lists, forbid patterns, search counts, proof
+rules, install safety, uninstall, fail-open faults, bad rule files, and 30
+parallel hook calls. CI runs both on Python 3.10 through 3.14 on Ubuntu,
+macOS, and Windows, and on Python 3.9 on macOS. Each suite must end with
+`0 failed`.
 
 ## 9. Troubleshooting
 
 | Symptom | Action |
 |---|---|
-| Hooks do not run | Run `RL doctor` first. Fix each FAIL line. Restart Claude Code. Run `/hooks`. Find five rulebooky entries. |
+| Hooks do not run | Run `RL doctor` first. It runs each hook command the way Claude Code does. Fix each FAIL line. Restart Claude Code. Run `/hooks`. Find six rulebooky entries. |
+| Every prompt says `UserPromptSubmit operation blocked by hook` | You have a hook command from v0.2.0 or older. Run `install` again, then restart Claude Code. |
 | `lint` shows errors | Read `references/rules-schema.md`. Fix tier and `check` type. |
 | `audit` stops each time | Run `task done N --evidence "..."` for each item. Meet `min_calls`. |
 | `python` not found | Run `install` again with `--python python`. The hooks will use it. |
@@ -275,13 +330,23 @@ runs it on Ubuntu, macOS, and Windows. Result must be `40 passed, 0 failed`.
   `deny_bash` patterns for such commands.
 - The Stop hook has a limit (`max_stop_blocks`, default 3 per prompt). This
   stops a bad card from locking the session. You can change it.
+- A single plain call of the rulebooky CLI (for example `task done 1
+  --evidence "removed rm -rf"`) skips `deny_bash` and `--forbid` checks, so
+  proof and rule text may name forbidden commands. A chained command (`;`,
+  `&&`, `|`, `$(...)`, backticks, redirects), `uninstall` and `rule remove`
+  are still checked.
+- Claude can run `rule remove` like any other command. Claude Code still asks
+  you before it runs Bash unless you allowed it. Review changes to
+  `rules.json` in git.
 - Proof is written by Claude. The hook checks that proof is present. It does
   not check that proof is true.
 - Hooks fail open. If a script has an error, the session goes on. The error
-  is written to `.claude/rulebooky/hook-errors.log`.
+  is written to `.claude/rulebooky/hook-errors.log`. A rule with a bad regex
+  is skipped and logged. The other rules still work. Run `RL lint` to find it.
 - Hook acts change with Claude Code versions. Check your version with
   `/hooks` and one real session.
-- Subagent counters are not verified. Assume the parent does not count them.
+- Tool calls made by subagents add to the same counters as the parent. The
+  `Stop` check runs only when the main session stops, not when a subagent stops.
 
 ## 11. Contribution and security
 
@@ -293,6 +358,3 @@ runs it on Ubuntu, macOS, and Windows. Result must be `40 passed, 0 failed`.
 ## 12. License
 
 MIT. See [LICENSE](LICENSE).
-#   C I   t r i g g e r  
- #   C I   r e t r y  
- 

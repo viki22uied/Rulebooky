@@ -1,5 +1,8 @@
 # rules.json schema
 
+Write rules with `RL rule add` (see SKILL.md) instead of editing this file
+directly; the CLI validates them. The format below is what it writes.
+
 ```json
 {
   "version": 1,
