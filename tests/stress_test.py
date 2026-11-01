@@ -778,7 +778,7 @@ def test_test_command_scenario():
         scenario_path = proj / "test-scenario.json"
         scenario_path.write_text(json.dumps(scenario))
         r = cli(proj, "test", "--scenario", str(scenario_path))
-        check("test --scenario works", r.returncode == 0 and "✓" in r.stdout)
+        check("test --scenario works", r.returncode == 0 and "2/2 scenario test(s) matched" in r.stdout)
 
 
 def test_sync_no_gh():

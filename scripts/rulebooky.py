@@ -8,28 +8,38 @@
   rulebooky.py task set --goal G [--method M] [--forbid REGEX]... [--min TOOL=N]... [--done-when D]
   rulebooky.py task add-req "text" | done N --evidence "..." | close [--force]
   rulebooky.py decide "text"
+  rulebooky.py rule add ID --tier hard|process|soft --text T [--deny-bash RE|--deny-path RE|--block-new GLOB [--allow F]...|--min TOOL=N] [--replace]
+  rulebooky.py rule remove ID | rule list
+  rulebooky.py discover [--apply] | test ... | log ... | history [ID] | sync push|pull|ci
 """
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "hooks"))
 import common as C  # noqa: E402
 
 HOOKS = {
-    "SessionStart": ("startup|resume|clear|compact", "inject.py session"),
+    "SessionStart": ("startup|resume|clear|compact|fork", "inject.py session"),
     "UserPromptSubmit": (None, "inject.py prompt"),
+    "SubagentStart": (None, "inject.py subagent"),
     "PreToolUse": (".*", "guard.py"),
     "PostToolUse": (".*", "track.py"),
     "Stop": (None, "audit.py"),
 }
 MARK = "rulebooky/hooks/"
+# Runtime files: per-machine, never committed, removed by `uninstall --purge`.
+RUNTIME_FILES = ("state.json", "state.lock", "hook-errors.log", "hook-errors.log.1",
+                 "actions.log", "actions.log.1", "rules-history.jsonl", "rules-history.jsonl.1")
 TIERS = ("hard", "process", "soft")
 HARD_CHECKS = ("deny_bash", "deny_path", "block_new_files")
 VAGUE = ("best practice", "clean code", "properly", "appropriate", "as needed",
@@ -37,27 +47,27 @@ VAGUE = ("best practice", "clean code", "properly", "appropriate", "as needed",
 
 # Rule discovery patterns
 DISCOVERY_PATTERNS = [
-    (r"(?i)don['']?t\s+(create|make|add|write)\s+(new\s+)?(\.md|markdown)\s+files?", 
-     {"id": "no-md-sprawl", "tier": "hard", "text": "Never create new .md files. Rules live only in .claude/rulebooky/rules.json.", 
+    (r"(?i)don['\u2019]?t\s+(create|make|add|write)\s+(new\s+)?(\.md|markdown)\s+files?",
+     {"id": "no-md-sprawl", "tier": "hard", "text": "Never create new .md files. Rules live only in .claude/rulebooky/rules.json.",
       "check": {"type": "block_new_files", "glob": "*.md", "allow": ["README.md", "CHANGELOG.md"]}}),
-    (r"(?i)don['']?t\s+(run|use|execute)\s+git\s+push\s+.*--force",
+    (r"(?i)don['\u2019]?t\s+(run|use|execute)\s+git\s+push\s+.*--force",
      {"id": "no-force-push", "tier": "hard", "text": "Never run git push --force or reset --hard without asking.",
       "check": {"type": "deny_bash", "pattern": "git\\s+push\\s+.*--force|git\\s+reset\\s+--hard"}}),
-    (r"(?i)don['']?t\s+(touch|modify|edit|change)\s+([`\"']?)migrations?/\2",
+    (r"(?i)don['\u2019]?t\s+(touch|modify|edit|change)\s+([`\"']?)migrations?/\2",
      {"id": "no-migrations-touch", "tier": "hard", "text": "Never touch migrations/ directory.",
       "check": {"type": "deny_path", "pattern": "migrations/"}}),
     (r"(?i)(search|research|look up|find)\s+(thoroughly|deeply|extensively|at least\s+(\d+)\s+times?)",
      {"id": "min-search", "tier": "process", "text": "Search thoroughly before answering (at least 3 WebSearch calls).",
       "check": {"type": "min_calls", "tool": "WebSearch", "n": 3}}),
-    (r"(?i)don['']?t\s+(commit|push)\s+(secrets?|passwords?|keys?|tokens?|api[_-]?keys?)",
+    (r"(?i)don['\u2019]?t\s+(commit|push)\s+(secrets?|passwords?|keys?|tokens?|api[_-]?keys?)",
      {"id": "no-secrets", "tier": "hard", "text": "Never commit secrets, passwords, keys, or tokens.",
       "check": {"type": "deny_bash", "pattern": "(password|secret|api[_-]?key|token)\\s*="}}),
-    (r"(?i)don['']?t\s+(install|add)\s+(packages?|dependencies|deps)\s+without\s+(asking|approval)",
+    (r"(?i)don['\u2019]?t\s+(install|add)\s+(packages?|dependencies|deps)\s+without\s+(asking|approval)",
      {"id": "no-deps-without-ask", "tier": "hard", "text": "Never install dependencies without asking.",
       "check": {"type": "deny_bash", "pattern": "(npm|yarn|pnpm|pip|poetry|go get|cargo add)\\s+(install|add)"}}),
     (r"(?i)(answer|respond|reply)\s+(in|with)\s+(short|brief|concise)\s+(point[-\s]?form|bullets?)",
      {"id": "point-form", "tier": "soft", "text": "Answer in short point-form unless asked otherwise."}),
-    (r"(?i)don['']?t\s+(create|make)\s+(new\s+)?files?\s+(unless|without)\s+(necessary|needed|asked)",
+    (r"(?i)don['\u2019]?t\s+(create|make)\s+(new\s+)?files?\s+(unless|without)\s+(necessary|needed|asked)",
      {"id": "no-unnecessary-files", "tier": "soft", "text": "Don't create new files unless necessary or asked."}),
     (r"(?i)(follow|adhere to|comply with)\s+([`\"']?)([^`\"'\n]+)\2",
      {"id": "follow-spec", "tier": "process", "text": "Follow the specified document/spec exactly.",
@@ -65,6 +75,8 @@ DISCOVERY_PATTERNS = [
 ]
 
 RULE_FILES = ["CLAUDE.md", ".cursorrules", "AGENTS.md", ".clauderc", "rules.md", "instructions.md", "CONTRIBUTING.md"]
+SKIP_DIRS = {"node_modules", ".git", ".claude", "skills", ".venv", "venv", "__pycache__", "dist", "build",
+             ".tox", ".mypy_cache", ".pytest_cache", "target", "vendor"}
 
 
 class Fail(Exception):
@@ -110,8 +122,53 @@ def read_settings(path):
     return data
 
 
+def hook_command(py, script):
+    """Shell command for settings.json. Only the path is quoted; the mode argument
+    (session/prompt/subagent) must stay OUTSIDE the quotes or Python looks for a
+    file literally named "inject.py prompt" and exits 2, which blocks every prompt."""
+    name, _, arg = script.partition(" ")
+    return '%s "$CLAUDE_PROJECT_DIR/.claude/rulebooky/hooks/%s"%s' % (py, name, " " + arg if arg else "")
+
+
+def hook_shell():
+    """argv prefix that runs a hook command the way Claude Code does (sh, or Git Bash on Windows)."""
+    if os.name != "nt":
+        return ["sh", "-c"]
+    # Windows: Claude Code uses Git Bash. Never pick System32\bash.exe (the WSL launcher).
+    cands = [os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")]
+    git = shutil.which("git")
+    if git:
+        root = Path(git).resolve().parent.parent  # ...\Git\cmd\git.exe -> ...\Git
+        cands += [str(root / "bin" / "bash.exe"), str(root / "usr" / "bin" / "bash.exe")]
+    cands += [r"C:\Program Files\Git\bin\bash.exe", shutil.which("bash")]
+    for c in cands:
+        if c and Path(c).is_file() and "system32" not in c.lower():
+            return [c, "-c"]
+    return None
+
+
+HOOK_PROBES = {
+    "SessionStart": ({"hook_event_name": "SessionStart", "source": "startup"}, (0,), "[RULEBOOKY]"),
+    "UserPromptSubmit": ({"hook_event_name": "UserPromptSubmit", "prompt": "doctor probe"}, (0,), "[RULEBOOKY]"),
+    "SubagentStart": ({"hook_event_name": "SubagentStart", "agent_type": "Explore"}, (0,), "additionalContext"),
+    "PreToolUse": ({"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {"file_path": "x"}}, (0,), None),
+    "PostToolUse": ({"hook_event_name": "PostToolUse"}, (0,), None),
+    "Stop": ({"hook_event_name": "Stop", "stop_hook_active": False}, (0, 2), None),  # 2 = open task, fine
+}
+
+
+def hook_interpreter(command):
+    """First word of a hook command; handles a quoted path with spaces (Windows)."""
+    command = command.strip()
+    if command.startswith('"'):
+        return command[1:].split('"', 1)[0]
+    return command.split(" ", 1)[0]
+
+
 def ours(entry):
-    return any(MARK in h.get("command", "") for h in entry.get("hooks", []))
+    if not isinstance(entry, dict):
+        return False
+    return any(isinstance(h, dict) and MARK in str(h.get("command", "")) for h in entry.get("hooks") or [])
 
 
 def need_installed():
@@ -145,7 +202,7 @@ def cmd_install(a):
     hooks = settings.setdefault("hooks", {})
     for event, (matcher, script) in HOOKS.items():
         kept = [e for e in hooks.get(event, []) if not ours(e)]
-        cmd = '%s "$CLAUDE_PROJECT_DIR/.claude/rulebooky/hooks/%s"' % (py, script)
+        cmd = hook_command(py, script)
         entry = {"hooks": [{"type": "command", "command": cmd}]}
         if matcher:
             entry["matcher"] = matcher
@@ -153,7 +210,12 @@ def cmd_install(a):
     C.save_json(settings_p, settings)
     gi = proj / ".gitignore"
     cur = gi.read_text(encoding="utf-8") if gi.exists() else ""
-    add = [l for l in (".claude/rulebooky/state.json", ".claude/rulebooky/hook-errors.log") if l not in cur]
+    have = set(cur.splitlines())
+    add = [l for l in (".claude/rulebooky/state.json", ".claude/rulebooky/state.lock",
+                       ".claude/rulebooky/hook-errors.log*",
+                       ".claude/rulebooky/actions.log*", ".claude/rulebooky/rules-history.jsonl*",
+                       ".claude/rulebooky/*.tmp")
+           if l not in have]
     if add:
         gi.write_text(cur + ("" if cur.endswith("\n") or not cur else "\n") + "\n".join(add) + "\n",
                       encoding="utf-8")
@@ -177,8 +239,11 @@ def cmd_uninstall(a):
     dst = proj / ".claude" / "rulebooky"
     if a.purge and dst.exists():
         shutil.rmtree(str(dst / "hooks"), ignore_errors=True)
-        for n in ("rulebooky.py", "state.json", "hook-errors.log"):
-            (dst / n).unlink() if (dst / n).exists() else None
+        for n in ("rulebooky.py",) + RUNTIME_FILES:
+            if (dst / n).exists():
+                (dst / n).unlink()
+        for tmp in dst.glob("*.tmp"):
+            tmp.unlink()
         print("Removed hooks and scripts. Kept %s (your rules)." % (dst / "rules.json"))
     else:
         print("Hooks removed from settings.json. Files left in place (use --purge to delete them).")
@@ -200,14 +265,17 @@ def cmd_doctor(a):
     missing = [s for s in scripts if not (C.rl_dir() / "hooks" / s).exists()]
     line(not missing, "hook scripts present" + (" (missing: %s; run install)" % ", ".join(missing) if missing else ""))
     interp = None
+    registered = []
     try:
         settings = read_settings(proj / ".claude" / "settings.json")
         hooks = settings.get("hooks", {})
         for ev in HOOKS:
-            found = [h["command"] for e in hooks.get(ev, []) if ours(e) for h in e["hooks"]]
+            found = [h["command"] for e in hooks.get(ev, []) if ours(e) for h in e["hooks"]
+                     if isinstance(h, dict) and MARK in str(h.get("command", ""))]
             line(bool(found), "%s hook registered" % ev + ("" if found else " (run install, then restart Claude Code)"))
+            registered.extend((ev, f) for f in found)
             if found and not interp:
-                interp = found[0].split(" ")[0].strip('"')
+                interp = hook_interpreter(found[0])
         if interp:
             line(working_python(interp), "hook interpreter '%s' runs Python 3" % interp +
                  ("" if working_python(interp) else " (re-run install with --python NAME)"))
@@ -223,15 +291,27 @@ def cmd_doctor(a):
     if err.exists() and err.read_text(encoding="utf-8", errors="replace").strip():
         tail = err.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-3:]
         line(False, "hook-errors.log has entries: " + " | ".join(tail), fatal=False)
-    py = interp if interp and working_python(interp) else sys.executable
-    guard = C.rl_dir() / "hooks" / "guard.py"
-    if guard.exists():
-        r = subprocess.run([py, str(guard)], input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "echo hi"}}),
-                           capture_output=True, text=True)
-        line(r.returncode == 0, "guard.py runs and allows a harmless command")
-        r = subprocess.run([py, str(C.rl_dir() / "hooks" / "inject.py"), "session"], input="{}",
-                           capture_output=True, text=True, encoding="utf-8")
-        line(r.returncode == 0 and "[RULEBOOKY]" in r.stdout, "inject.py prints the rules")
+    # Run every registered command exactly as Claude Code will: through a shell,
+    # with $CLAUDE_PROJECT_DIR set. This catches quoting and path bugs.
+    shell = hook_shell()
+    if shell is None:
+        line(False, "bash not found; cannot run hook commands (Claude Code on Windows uses Git Bash)", fatal=False)
+    elif registered:
+        env = dict(os.environ, CLAUDE_PROJECT_DIR=str(proj))
+        sp = C.state_path()
+        saved = sp.read_bytes() if sp.exists() else None  # probes must not change the task card
+        for ev, cmd in registered:
+            event, codes, want = HOOK_PROBES[ev]
+            try:
+                r = subprocess.run(shell + [cmd], input=json.dumps(event), capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", env=env, cwd=str(proj), timeout=30)
+                ok = r.returncode in codes and (want is None or want in r.stdout)
+                why = "" if ok else " (exit %d: %s)" % (r.returncode, (r.stderr or r.stdout).strip()[:200])
+            except Exception as e:
+                ok, why = False, " (%s)" % e
+            line(ok, "%s hook command runs" % ev + why)
+        if saved is not None:
+            sp.write_bytes(saved)
     print("\nAll good." if not bad else "\n%d problem(s). Fix the FAIL lines, then restart Claude Code." % len(bad))
     if bad:
         print("Run: python .claude/rulebooky/rulebooky.py doctor  (after fixes)")
@@ -244,9 +324,24 @@ def cmd_lint(a):
         print("ERROR: no readable rules.json at %s (invalid JSON or missing)" % C.rules_path())
         return 1
     errs, warns, ids = [], [], set()
+    if not isinstance(rules, dict):
+        print("ERROR: rules.json must be a JSON object with a \"rules\" list")
+        return 1
     rs = rules.get("rules", [])
+    if not isinstance(rs, list):
+        print("ERROR: \"rules\" must be a list")
+        return 1
+    bad_entries = [x for x in rs if not isinstance(x, dict)]
+    if bad_entries:
+        errs.append("%d entr%s in \"rules\" not an object" % (len(bad_entries), "y is" if len(bad_entries) == 1 else "ies are"))
+    rs = [x for x in rs if isinstance(x, dict)]
+    msb = rules.get("max_stop_blocks", 3)
+    if not isinstance(msb, int) or isinstance(msb, bool) or msb < 0:
+        errs.append("max_stop_blocks must be a whole number >= 0")
     for r in rs:
-        rid = r.get("id", "?")
+        rid = str(r.get("id") or "?")
+        if rid == "?":
+            errs.append("a rule is missing its id")
         if rid in ids:
             errs.append("duplicate id: " + rid)
         ids.add(rid)
@@ -254,13 +349,18 @@ def cmd_lint(a):
             errs.append("%s: tier must be one of %s" % (rid, TIERS))
         if not r.get("text"):
             errs.append("%s: missing text" % rid)
+        elif not isinstance(r["text"], str):
+            errs.append("%s: text must be a string" % rid)
         elif len(r["text"]) > 160:
             warns.append("%s: text over 160 chars, long rules get ignored" % rid)
-        low = r.get("text", "").lower()
+        low = str(r.get("text", "")).lower()
         for v in VAGUE:
             if v in low:
                 warns.append("%s: vague wording '%s', make it checkable" % (rid, v.strip()))
         c = r.get("check")
+        if c is not None and not isinstance(c, dict):
+            errs.append("%s: check must be an object" % rid)
+            continue
         if r.get("tier") == "hard":
             if not c or c.get("type") not in HARD_CHECKS:
                 errs.append("%s: hard rule needs check.type in %s (else make it soft)" % (rid, HARD_CHECKS))
@@ -274,10 +374,14 @@ def cmd_lint(a):
                             re.compile(pat)
                         except re.error as e:
                             errs.append("%s: bad regex: %s" % (rid, e))
-                if c["type"] == "block_new_files" and not c.get("glob"):
-                    errs.append("%s: block_new_files needs glob" % rid)
+                if c["type"] == "block_new_files":
+                    if not c.get("glob"):
+                        errs.append("%s: block_new_files needs glob" % rid)
+                    if not isinstance(c.get("allow", []), list):
+                        errs.append("%s: allow must be a list of file names" % rid)
         if r.get("tier") == "process" and c:
-            if c.get("type") != "min_calls" or not c.get("tool") or not str(c.get("n", "")).isdigit():
+            if (c.get("type") != "min_calls" or not c.get("tool") or isinstance(c.get("n"), bool)
+                    or not str(c.get("n", "")).isdigit()):
                 errs.append("%s: process check must be {type:min_calls, tool, n}" % rid)
     soft = sum(1 for r in rs if r.get("tier") == "soft")
     if soft > 10:
@@ -317,16 +421,17 @@ def extract_rules_from_text(text, source):
 def scan_rule_files(proj):
     """Scan project for common rule files and extract rules."""
     all_found = []
-    for fname in RULE_FILES:
-        for path in proj.rglob(fname):
-            if any(p in path.parts for p in ("node_modules", ".git", ".claude", "skills")):
-                continue
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-                found = extract_rules_from_text(text, str(path.relative_to(proj)))
-                all_found.extend(found)
-            except Exception:
-                pass
+    wanted = set(RULE_FILES)
+    paths = []
+    for root, dirs, files in os.walk(str(proj)):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)  # prune: never walk node_modules etc.
+        paths.extend(Path(root) / f for f in sorted(files) if f in wanted)
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            all_found.extend(extract_rules_from_text(text, str(path.relative_to(proj))))
+        except Exception:
+            pass
     return all_found
 
 
@@ -343,37 +448,37 @@ def deduplicate_rules(rules):
 def cmd_discover(a):
     need_installed()
     proj = C.project_dir()
-    
+
     print(f"Scanning {proj} for rule files...")
     found = scan_rule_files(proj)
     found = deduplicate_rules(found)
-    
+
     if not found:
         print("No recognizable rules found in common rule files.")
         print("Checked:", ", ".join(RULE_FILES))
         return 0
-    
+
     print(f"\nFound {len(found)} candidate rule(s):\n")
-    
+
     rules_path = C.rules_path()
     existing = C.load_json(rules_path, {"rules": []})
     existing_ids = {r.get("id") for r in existing.get("rules", [])}
-    
+
     to_add = []
     for r in found:
         rid = r.get("id")
         status = "EXISTS" if rid in existing_ids else "NEW"
-        print(f"  [{status}] {rid} ({r.get('tier')}) - {r.get('text')[:80]}...")
+        print(f"  [{status}] {rid} ({r.get('tier')}) - {r.get('text')}")
         if r.get("_matches"):
             for m in r["_matches"]:
                 print(f"      matched: \"{m[:100]}\"")
         if status == "NEW":
             to_add.append(r)
-    
+
     if not to_add:
         print("\nAll rules already exist in rules.json")
         return 0
-    
+
     if a.apply:
         for r in to_add:
             clean = {k: v for k, v in r.items() if not k.startswith("_")}
@@ -390,30 +495,41 @@ def cmd_discover(a):
 
 def simulate_tool_call(tool_name, tool_input, rules, state):
     """Simulate guard.py check without blocking."""
-    from hooks.guard import check
-    ev = {"tool_name": tool_name, "tool_input": tool_input}
-    return check(ev, rules, state)
+    import guard  # hooks/ is on sys.path
+    ev = {"tool_name": tool_name, "tool_input": tool_input if isinstance(tool_input, dict) else {}}
+    return [msg for msg, _rid, _text in guard.check(ev, rules, state)]
+
+
+def rules_from(data):
+    """Accept one rule object, a list of rules, or a whole rules.json."""
+    if isinstance(data, dict) and isinstance(data.get("rules"), list):
+        return {"rules": data["rules"]}
+    if isinstance(data, dict):
+        return {"rules": [data]}
+    if isinstance(data, list):
+        return {"rules": data}
+    raise Fail("rule data must be a rule object, a list of rules, or a rules.json object")
 
 
 def cmd_test(a):
     need_installed()
     rules = C.load_rules()
     state = C.load_state()
-    
+
     if a.rule_file:
         rule_data = C.load_json(a.rule_file, None)
         if rule_data is None:
             raise Fail(f"Cannot read rule file: {a.rule_file}")
-        test_rules = {"rules": [rule_data] if isinstance(rule_data, dict) else rule_data.get("rules", [])}
+        test_rules = rules_from(rule_data)
     elif a.rule_json:
         try:
             rule_data = json.loads(a.rule_json)
         except json.JSONDecodeError as e:
             raise Fail(f"Invalid JSON: {e}")
-        test_rules = {"rules": [rule_data] if isinstance(rule_data, dict) else rule_data.get("rules", [])}
+        test_rules = rules_from(rule_data)
     else:
         test_rules = rules
-    
+
     if a.tool and a.input:
         try:
             tool_input = json.loads(a.input)
@@ -429,20 +545,26 @@ def cmd_test(a):
     elif a.scenario:
         # Run multiple test cases from a scenario file
         scenario = C.load_json(a.scenario, None)
-        if not scenario or "tests" not in scenario:
-            raise Fail("Scenario file must have a 'tests' array")
+        if not isinstance(scenario, dict) or not isinstance(scenario.get("tests"), list):
+            raise Fail("Scenario file must be a JSON object with a 'tests' array")
+        mismatches = 0
         for i, test in enumerate(scenario["tests"], 1):
+            if not isinstance(test, dict):
+                raise Fail("test %d is not an object" % i)
             tool = test.get("tool")
             inp = test.get("input", {})
             expected = test.get("expected", "allowed")
+            if expected not in ("allowed", "blocked"):
+                raise Fail("test %d: expected must be 'allowed' or 'blocked' (got %r)" % (i, expected))
             problems = simulate_tool_call(tool, inp, test_rules, state)
-            blocked = bool(problems)
-            status = "BLOCKED" if blocked else "ALLOWED"
-            match = "✓" if (blocked and expected == "blocked") or (not blocked and expected == "allowed") else "✗"
-            print(f"Test {i}: {match} {status} (expected {expected}) - {tool}")
-            if problems:
-                for p in problems:
-                    print(f"    - {p}")
+            status = "blocked" if problems else "allowed"
+            ok = status == expected
+            mismatches += not ok
+            print("Test %d: %s %s (expected %s) - %s" % (i, "PASS" if ok else "FAIL", status.upper(), expected, tool))
+            for p in problems:
+                print("    - " + p)
+        print("\n%d/%d scenario test(s) matched" % (len(scenario["tests"]) - mismatches, len(scenario["tests"])))
+        return 1 if mismatches else 0
     else:
         raise Fail("Provide --tool/--input or --scenario")
     return 0
@@ -451,11 +573,10 @@ def cmd_test(a):
 # ---------- observability log ----------
 
 def parse_since(since_str):
-    """Parse '7d', '24h', '30m' into seconds ago."""
-    import re
-    m = re.match(r"(\d+)([dhms])", since_str)
+    """Parse '7d', '24h', '30m', '10s' into an epoch timestamp."""
+    m = re.fullmatch(r"\s*(\d+)\s*([dhms])\s*", since_str or "")
     if not m:
-        return 0
+        raise Fail("--since must look like 7d, 24h, 30m or 10s (got %r)" % since_str)
     val, unit = int(m.group(1)), m.group(2)
     mult = {"d": 86400, "h": 3600, "m": 60, "s": 1}
     return time.time() - val * mult[unit]
@@ -467,19 +588,21 @@ def cmd_log(a):
     if not log_path.exists():
         print("No actions.log found. Run some tasks first.")
         return 0
-    
+
     since_ts = parse_since(a.since) if a.since else 0
     filter_type = a.type
     filter_tool = a.tool
-    
+
     entries = []
-    with open(log_path, encoding="utf-8") as f:
+    with open(str(log_path), encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
                 entry = json.loads(line)
+                if not isinstance(entry, dict):
+                    continue
                 if since_ts and entry.get("ts"):
                     try:
                         entry_ts = time.mktime(time.strptime(entry["ts"], "%Y-%m-%d %H:%M:%S"))
@@ -494,48 +617,49 @@ def cmd_log(a):
                 entries.append(entry)
             except json.JSONDecodeError:
                 pass
-    
+
     if a.format == "json":
         print(json.dumps(entries, indent=2))
         return 0
-    
+
     if not entries:
         print("No matching log entries.")
         return 0
-    
+
     # Summary stats
     blocked = sum(1 for e in entries if e.get("result") == "blocked")
     allowed = sum(1 for e in entries if e.get("result") == "allowed")
     stop_blocks = sum(1 for e in entries if e.get("type") == "stop_block")
-    
+
     print(f"Total: {len(entries)} | Blocked: {blocked} | Allowed: {allowed} | Stop blocks: {stop_blocks}")
     print()
-    
+
     if a.format == "summary":
         # Group by rule
         by_rule = {}
         for e in entries:
             if e.get("type") == "blocked":
-                rid = e.get("rule_id", "unknown")
+                rid = e.get("rule_id") or "unknown"
                 by_rule[rid] = by_rule.get(rid, 0) + 1
         if by_rule:
             print("Blocks by rule:")
             for rid, count in sorted(by_rule.items(), key=lambda x: -x[1]):
                 print(f"  {rid}: {count}")
         return 0
-    
+
     # Default: table format
-    for e in entries[-a.limit:]:
-        ts = e.get("ts", "")
-        typ = e.get("type", "")
-        tool = e.get("tool", "")
-        result = e.get("result", "")
-        rule = e.get("rule_id", "")
-        text = e.get("rule_text", "")[:60]
+    for e in entries[-a.limit:] if a.limit > 0 else entries:
+        ts = str(e.get("ts") or "")
+        typ = str(e.get("type") or "")
+        tool = str(e.get("tool") or "")
+        rule = str(e.get("rule_id") or "")
+        text = str(e.get("rule_text") or "")[:60]
         if typ == "blocked":
             print(f"{ts}  BLOCKED  {tool:12}  {rule:20}  {text}")
         elif typ == "stop_block":
             print(f"{ts}  STOP_BLOCK                    {rule:20}  {text}")
+        elif typ == "subagent_inject":
+            print(f"{ts}  SUBAGENT {tool:12}  rules + task card injected")
         else:
             print(f"{ts}  ALLOWED  {tool:12}")
     return 0
@@ -549,7 +673,7 @@ def cmd_history(a):
     if not hist_path.exists():
         print("No rules-history.jsonl found.")
         return 0
-    
+
     entries = []
     with open(hist_path, encoding="utf-8") as f:
         for line in f:
@@ -559,131 +683,206 @@ def cmd_history(a):
                     entries.append(json.loads(line))
                 except json.JSONDecodeError:
                     pass
-    
-    if a.rule_id:
-        # Blame mode: show history for specific rule
-        found = False
-        for e in entries:
-            if a.rule_id in e.get("rule_ids", []):
-                print(f"{e['ts']}  v{e.get('version',1)}  {e['rules_count']} rules  (+{a.rule_id})")
-                found = True
-        if not found:
-            print(f"Rule '{a.rule_id}' not found in history")
+
+    if not entries:
+        print("rules-history.jsonl is empty.")
         return 0
-    
-    # Full history
-    for e in entries[-a.limit:]:
-        added = set(e.get("rule_ids", []))
-        if entries:
-            prev_ids = set(entries[entries.index(e)-1].get("rule_ids", [])) if entries.index(e) > 0 else set()
-            new_rules = added - prev_ids
-            removed_rules = prev_ids - added
-            changes = []
-            if new_rules:
-                changes.append(f"+{','.join(new_rules)}")
-            if removed_rules:
-                changes.append(f"-{','.join(removed_rules)}")
-            change_str = " ".join(changes) if changes else "no change"
+
+    def ids_of(e):
+        return [i for i in (e.get("rule_ids") or []) if i]
+
+    if a.rule_id:
+        # Blame mode: show when the rule was added and removed
+        present, found = False, False
+        for e in entries:
+            now = a.rule_id in ids_of(e)
+            if now != present:
+                print("%s  v%s  %s  %s" % (e.get("ts", "?"), e.get("version", 1),
+                                           "added" if now else "removed", a.rule_id))
+                found = True
+            present = now
+        if not found:
+            print("Rule '%s' not found in history" % a.rule_id)
+        return 0
+
+    # Full history: each line shows what changed against the entry before it
+    start = max(0, len(entries) - a.limit) if a.limit > 0 else 0
+    for idx in range(start, len(entries)):
+        e = entries[idx]
+        cur = ids_of(e)
+        if idx == 0:
+            change_str = "init %d rules" % len(cur)
         else:
-            change_str = f"init {len(added)} rules"
-        print(f"{e['ts']}  v{e.get('version',1)}  {e['rules_count']} rules  {change_str}")
+            prev = ids_of(entries[idx - 1])
+            added = [i for i in cur if i not in prev]
+            removed = [i for i in prev if i not in cur]
+            changes = (["+" + ",".join(added)] if added else []) + (["-" + ",".join(removed)] if removed else [])
+            change_str = " ".join(changes) if changes else "edited (same ids)"
+        print("%s  v%s  %s rules  %s" % (e.get("ts", "?"), e.get("version", 1), e.get("rules_count", len(cur)), change_str))
     return 0
 
 
 # ---------- team sync ----------
 
+def gh(args, stdin=None):
+    """Run the GitHub CLI; friendly error if it is missing."""
+    try:
+        return subprocess.run(["gh"] + args, input=stdin, capture_output=True, text=True, encoding="utf-8")
+    except FileNotFoundError:
+        raise Fail("GitHub CLI (gh) not installed. Install: https://cli.github.com, then run: gh auth login")
+
+
+def fetch_remote_rules(gist_id):
+    r = gh(["gist", "view", gist_id, "--raw", "--filename", "rules.json"])
+    if r.returncode != 0:
+        raise Fail("Cannot fetch gist %s: %s" % (gist_id, r.stderr.strip()))
+    try:
+        data = json.loads(r.stdout)
+    except ValueError as e:
+        raise Fail("gist %s does not hold valid rules.json JSON: %s" % (gist_id, e))
+    if not isinstance(data, dict) or not isinstance(data.get("rules"), list):
+        raise Fail("gist %s rules.json must be an object with a \"rules\" list" % gist_id)
+    return data
+
+
 def cmd_sync(a):
     need_installed()
     rules_path = C.rules_path()
     rules = C.load_json(rules_path, None)
-    if rules is None:
+    if not isinstance(rules, dict):
         raise Fail("No readable rules.json")
-    
+    gist_id = a.gist_id or rules.get("gist_id")
+
     if a.sub == "push":
-        # Push to GitHub Gist (requires gh CLI)
-        import subprocess
-        try:
-            # Create or update gist
-            desc = f"rulebooky rules for {C.project_dir().name}"
-            content = json.dumps(rules, indent=2)
-            result = subprocess.run(
-                ["gh", "gist", "create", "--desc", desc, "-f", "rules.json", "-"],
-                input=content.encode(),
-                capture_output=True
-            )
-            if result.returncode != 0:
-                # Try update if exists
-                gist_id = a.gist_id or rules.get("gist_id")
-                if gist_id:
-                    result = subprocess.run(
-                        ["gh", "gist", "edit", gist_id, "-f", "rules.json", "-"],
-                        input=content.encode(),
-                        capture_output=True
-                    )
-            if result.returncode == 0:
-                url = result.stdout.decode().strip()
-                # Extract gist ID from URL
-                import re
-                m = re.search(r"/([a-f0-9]{32})", url)
-                if m:
-                    rules["gist_id"] = m.group(1)
-                    C.save_json(rules_path, rules)
-                print(f"Pushed to: {url}")
-            else:
-                raise Fail(f"gh gist failed: {result.stderr.decode()}")
-        except FileNotFoundError:
-            raise Fail("GitHub CLI (gh) not installed. Install: https://cli.github.com")
-    
-    elif a.sub == "pull":
-        import subprocess
-        gist_id = a.gist_id or rules.get("gist_id")
-        if not gist_id:
-            raise Fail("No gist_id. Provide --gist-id or run push first.")
-        result = subprocess.run(["gh", "gist", "view", gist_id, "--raw", "rules.json"], capture_output=True)
-        if result.returncode != 0:
-            raise Fail(f"Failed to pull: {result.stderr.decode()}")
-        remote_rules = json.loads(result.stdout.decode())
-        # Merge strategy: keep local task card, update rules
-        local_state = C.load_state()
-        C.save_json(rules_path, remote_rules)
-        print(f"Pulled rules from gist {gist_id} ({len(remote_rules.get('rules', []))} rules)")
-        print("Run: python .claude/rulebooky/rulebooky.py lint")
-    
-    elif a.sub == "ci":
-        # CI validation: exit 1 if rules.json differs from remote
-        import subprocess
-        gist_id = a.gist_id or rules.get("gist_id")
-        if not gist_id:
+        content = json.dumps(rules, indent=2, ensure_ascii=False)
+        if gist_id:
+            # Update the existing gist in place (never create duplicates).
+            tmpdir = tempfile.mkdtemp(prefix="rulebooky-")
+            try:
+                tmp = Path(tmpdir) / "rules.json"
+                tmp.write_text(content, encoding="utf-8")
+                r = gh(["gist", "edit", gist_id, "--filename", "rules.json", str(tmp)])
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            if r.returncode != 0:
+                raise Fail("gh gist edit failed: %s" % r.stderr.strip())
+            print("Pushed to gist %s" % gist_id)
+        else:
+            desc = "rulebooky rules for %s" % C.project_dir().name
+            r = gh(["gist", "create", "--desc", desc, "--filename", "rules.json", "-"], stdin=content)
+            if r.returncode != 0:
+                raise Fail("gh gist create failed: %s" % r.stderr.strip())
+            url = r.stdout.strip()
+            m = re.search(r"([0-9a-f]{20,})\s*$", url)
+            if m:
+                rules["gist_id"] = m.group(1)
+                C.save_json(rules_path, rules)
+                print("Saved gist_id %s in rules.json (commit it so your team can pull)." % m.group(1))
+            print("Pushed to: %s" % url)
+        return 0
+
+    if not gist_id:
+        if a.sub == "ci":
             print("No remote gist configured. Skipping CI check.")
             return 0
-        result = subprocess.run(["gh", "gist", "view", gist_id, "--raw", "rules.json"], capture_output=True)
-        if result.returncode != 0:
-            raise Fail(f"Cannot fetch remote rules: {result.stderr.decode()}")
-        remote_rules = json.loads(result.stdout.decode())
-        # Compare rule IDs and content (ignore version, gist_id)
-        local_rules = [r for r in rules.get("rules", []) if r.get("id")]
-        remote_rule_list = [r for r in remote_rules.get("rules", []) if r.get("id")]
-        local_ids = {r["id"]: r for r in local_rules}
-        remote_ids = {r["id"]: r for r in remote_rule_list}
-        
-        if local_ids.keys() != remote_ids.keys():
-            print("RULES DIVERGED: Rule IDs differ")
-            print(f"  Local only:  {set(local_ids) - set(remote_ids)}")
-            print(f"  Remote only: {set(remote_ids) - set(local_ids)}")
-            return 1
-        
-        for rid, local in local_ids.items():
-            remote = remote_ids[rid]
-            # Compare check config and text
-            if local.get("text") != remote.get("text") or local.get("check") != remote.get("check"):
-                print(f"RULE DIVERGED: {rid}")
-                print(f"  Local text:  {local.get('text')[:80]}")
-                print(f"  Remote text: {remote.get('text')[:80]}")
-                return 1
-        
-        print("CI OK: rules.json matches remote")
+        raise Fail("No gist_id. Provide --gist-id or run push first.")
+    remote = fetch_remote_rules(gist_id)
+
+    if a.sub == "pull":
+        remote.setdefault("gist_id", gist_id)
+        C.save_json(rules_path, remote)
+        print("Pulled rules from gist %s (%d rules)" % (gist_id, len(remote["rules"])))
+        print("Run: python .claude/rulebooky/rulebooky.py lint")
         return 0
+
+    # ci: exit 1 if local rules differ from remote (ignores version and gist_id)
+    def by_id(data):
+        return {r["id"]: r for r in data.get("rules", []) if isinstance(r, dict) and r.get("id")}
+    local_ids, remote_ids = by_id(rules), by_id(remote)
+    if local_ids.keys() != remote_ids.keys():
+        print("RULES DIVERGED: Rule IDs differ")
+        print("  Local only:  %s" % sorted(set(local_ids) - set(remote_ids)))
+        print("  Remote only: %s" % sorted(set(remote_ids) - set(local_ids)))
+        return 1
+    for rid, local in local_ids.items():
+        other = remote_ids[rid]
+        if any(local.get(k) != other.get(k) for k in ("text", "tier", "check")):
+            print("RULE DIVERGED: %s" % rid)
+            print("  Local:  %s" % json.dumps({k: local.get(k) for k in ("tier", "text", "check")}, ensure_ascii=False))
+            print("  Remote: %s" % json.dumps({k: other.get(k) for k in ("tier", "text", "check")}, ensure_ascii=False))
+            return 1
+    print("CI OK: rules.json matches remote")
     return 0
+
+
+def cmd_rule(a):
+    """Add/remove/list rules from the CLI. Claude Code treats .claude/ files as
+    sensitive and refuses or prompts for direct Write/Edit, so this is how
+    Claude changes rules.json."""
+    need_installed()
+    rp = C.rules_path()
+    data = C.load_json(rp, None) if rp.exists() else {"version": 1, "max_stop_blocks": 3, "canary": "", "rules": []}
+    if not isinstance(data, dict) or not isinstance(data.get("rules"), list):
+        raise Fail("rules.json is not valid (run lint); refusing to overwrite it")
+    rules = data["rules"]
+    if a.sub == "list":
+        for r in rules:
+            if isinstance(r, dict):
+                print("%-24s %-8s %s%s" % (r.get("id"), r.get("tier"), r.get("text"),
+                                          "  check=" + json.dumps(r["check"]) if r.get("check") else ""))
+        return 0
+    if a.sub == "remove":
+        keep = [r for r in rules if not (isinstance(r, dict) and r.get("id") == a.id)]
+        if len(keep) == len(rules):
+            raise Fail("No rule with id %r. Use `rule list`." % a.id)
+        data["rules"] = keep
+        C.save_json(rp, data)
+        print("Removed rule %s." % a.id)
+        return cmd_lint(a)
+    # add
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", a.id):
+        raise Fail("id must be a short slug like no-rm-rf (letters, digits, - _ .)")
+    if not a.text.strip():
+        raise Fail("--text is empty")
+    checks = []
+    for kind, pat in (("deny_bash", a.deny_bash), ("deny_path", a.deny_path)):
+        if pat is not None:
+            try:
+                re.compile(pat)
+            except re.error as e:
+                raise Fail("--%s %r is not a valid regex: %s" % (kind.replace("_", "-"), pat, e))
+            checks.append({"type": kind, "pattern": pat})
+    if a.block_new is not None:
+        checks.append({"type": "block_new_files", "glob": a.block_new, "allow": a.allow or []})
+    elif a.allow:
+        raise Fail("--allow only works with --block-new")
+    if a.min is not None:
+        tool, _, n = a.min.partition("=")
+        if not tool.strip() or not n.strip().isdigit():
+            raise Fail("--min must look like WebSearch=5 (got %r)" % a.min)
+        checks.append({"type": "min_calls", "tool": tool.strip(), "n": int(n)})
+    if len(checks) > 1:
+        raise Fail("one check per rule; add several rules instead")
+    check = checks[0] if checks else None
+    if a.tier == "hard" and (not check or check["type"] not in HARD_CHECKS):
+        raise Fail("a hard rule needs --deny-bash, --deny-path or --block-new (else use --tier soft)")
+    if a.tier == "process" and check and check["type"] != "min_calls":
+        raise Fail("a process rule takes only --min TOOL=N")
+    if a.tier == "soft" and check:
+        raise Fail("a soft rule has no check; use --tier hard or process")
+    rule = {"id": a.id, "tier": a.tier, "text": a.text.strip()}
+    if check:
+        rule["check"] = check
+    idx = [i for i, r in enumerate(rules) if isinstance(r, dict) and r.get("id") == a.id]
+    if idx and not a.replace:
+        raise Fail("rule %r already exists; pass --replace to overwrite it" % a.id)
+    if idx:
+        rules[idx[0]] = rule
+    else:
+        rules.append(rule)
+    C.save_json(rp, data)
+    print("%s rule %s." % ("Replaced" if idx else "Added", a.id))
+    return cmd_lint(a)
 
 
 def cmd_status(a):
@@ -694,6 +893,11 @@ def cmd_status(a):
 
 def cmd_task(a):
     need_installed()
+    with C.state_lock():
+        return _task(a)
+
+
+def _task(a):
     st = C.load_state()
     t = st.get("task")
     if a.sub == "set":
@@ -705,6 +909,7 @@ def cmd_task(a):
         mins = {}
         for m in a.min or []:
             tool, _, n = m.partition("=")
+            tool, n = tool.strip(), n.strip()
             if not tool or not n.isdigit():
                 raise Fail("--min must look like WebSearch=5 (got %r)" % m)
             mins[tool] = int(n)
@@ -714,8 +919,12 @@ def cmd_task(a):
     elif not t:
         raise Fail("No open task. Run: task set --goal ...")
     elif a.sub == "add-req":
+        if not a.text.strip():
+            raise Fail("Requirement text is empty.")
+        t.setdefault("reqs", [])
         t["reqs"].append({"text": a.text, "done": False, "evidence": ""})
     elif a.sub == "done":
+        t.setdefault("reqs", [])
         if not 1 <= a.n <= len(t["reqs"]):
             raise Fail("No requirement %d (task has %d). Use `status` to list them." % (a.n, len(t["reqs"])))
         if not a.evidence.strip():
@@ -734,9 +943,17 @@ def cmd_task(a):
 
 def cmd_decide(a):
     need_installed()
+    with C.state_lock():
+        return _decide(a)
+
+
+def _decide(a):
     st = C.load_state()
+    if not a.text.strip():
+        raise Fail("Decision text is empty.")
     st["decisions"] = (st["decisions"] + [a.text])[-20:]
     C.save_state(st)
+    print("Saved decision (%d kept)." % len(st["decisions"]))
     return 0
 
 
@@ -754,6 +971,16 @@ def main():
     sp.add_parser("status").set_defaults(f=cmd_status)
     sp.add_parser("brief").set_defaults(f=cmd_status)
     d = sp.add_parser("decide"); d.add_argument("text"); d.set_defaults(f=cmd_decide)
+    rl = sp.add_parser("rule", help="add/remove/list rules (use this, not direct edits of rules.json)")
+    rls = rl.add_subparsers(dest="sub", required=True)
+    ra = rls.add_parser("add"); ra.add_argument("id")
+    ra.add_argument("--tier", choices=TIERS, required=True); ra.add_argument("--text", required=True)
+    ra.add_argument("--deny-bash"); ra.add_argument("--deny-path"); ra.add_argument("--block-new", metavar="GLOB")
+    ra.add_argument("--allow", action="append", metavar="FILENAME"); ra.add_argument("--min", metavar="TOOL=N")
+    ra.add_argument("--replace", action="store_true")
+    rr = rls.add_parser("remove"); rr.add_argument("id")
+    rls.add_parser("list")
+    rl.set_defaults(f=cmd_rule)
     disc = sp.add_parser("discover"); disc.add_argument("--apply", action="store_true"); disc.set_defaults(f=cmd_discover)
     test = sp.add_parser("test")
     test.add_argument("--rule-file"); test.add_argument("--rule-json")
@@ -796,6 +1023,12 @@ def main():
     except Fail as e:
         print("rulebooky: %s" % e)
         sys.exit(1)
+    except BrokenPipeError:  # output piped into `head` etc.
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except Exception:
+            pass
+        sys.exit(0)
 
 
 if __name__ == "__main__":
