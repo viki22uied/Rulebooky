@@ -4,6 +4,7 @@ import fnmatch
 import importlib
 import os
 import re
+import shlex
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -44,59 +45,90 @@ def _call(name, *args, **kwargs):
     return getattr(c, name)(*args, **kwargs)
 
 
+def _search(pattern, text, rid):
+    """re.search that skips (and logs) a broken pattern instead of disabling every rule."""
+    try:
+        return re.search(pattern, text)
+    except (re.error, TypeError) as e:
+        _call("log_error", "guard: skipped rule %r, bad pattern %r: %s (run lint)" % (rid, pattern, e))
+        return None
+
+
+# CLI subcommands whose arguments are free text that often quotes forbidden words
+# (evidence, rule text, test inputs). Not exempt: uninstall, rule remove/--replace.
+_SAFE_CLI = {"task", "decide", "status", "brief", "lint", "test", "log", "history", "doctor", "discover"}
+
+
+def is_own_cli_call(cmd):
+    """True only for ONE plain call of the rulebooky CLI, e.g.
+    python .claude/rulebooky/rulebooky.py task done 1 --evidence "removed rm -rf".
+    Anything chained, piped, redirected or with command substitution is not exempt."""
+    if not cmd or "`" in cmd or "$(" in cmd or "\n" in cmd or "\r" in cmd:
+        return False
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        toks = list(lex)
+    except ValueError:
+        return False
+    if len(toks) < 3 or any(t and all(ch in "();<>|&" for ch in t) for t in toks):
+        return False
+    exe = os.path.basename(toks[0].replace("\\", "/")).lower()
+    if not re.fullmatch(r"(python[0-9.]*|py)(\.exe)?", exe):
+        return False
+    if not toks[1].replace("\\", "/").endswith(".claude/rulebooky/rulebooky.py"):
+        return False
+    sub = toks[2]
+    if sub in _SAFE_CLI:
+        return True
+    if sub == "rule" and len(toks) > 3 and toks[3] in ("add", "list") and "--replace" not in toks:
+        return True
+    return False
+
+
 def check(ev, rules, state):
     tool = ev.get("tool_name", "")
-    inp = ev.get("tool_input") or {}
+    inp = ev.get("tool_input")
+    if not isinstance(inp, dict):
+        inp = {}
     problems = []
-    hard = [r for r in rules["rules"] if r.get("tier") == "hard" and r.get("check")]
-    forbid = (state.get("task") or {}).get("forbid", [])
+    hard = [r for r in rules.get("rules", [])
+            if isinstance(r, dict) and r.get("tier") == "hard" and isinstance(r.get("check"), dict)]
+    forbid = (state.get("task") or {}).get("forbid") or []
+
+    def hit(r, extra=""):
+        problems.append(("rule '%s': %s%s" % (r.get("id"), r.get("text"), extra), r.get("id"), r.get("text")))
 
     if tool == "Bash":
-        cmd = inp.get("command", "")
+        cmd = inp.get("command") or ""
+        if not isinstance(cmd, str) or is_own_cli_call(cmd):
+            cmd = ""
         for r in hard:
             c = r["check"]
-            if c["type"] == "deny_bash" and re.search(c["pattern"], cmd):
-                problems.append(("rule '%s': %s" % (r["id"], r["text"]), r["id"], r["text"]))
+            if c.get("type") == "deny_bash" and _search(c.get("pattern"), cmd, r.get("id")):
+                hit(r)
         for pat in forbid:
-            if re.search(pat, cmd):
+            if _search(pat, cmd, "task-forbid"):
                 problems.append(("task card forbids /%s/" % pat, "task-forbid", pat))
 
     if tool in WRITE_TOOLS:
         path = inp.get("file_path") or inp.get("notebook_path") or ""
         norm_path = path.replace("\\", "/")
-        base = os.path.basename(path)
+        base = os.path.basename(norm_path)
         for r in hard:
             c = r["check"]
-            if c["type"] == "deny_path" and re.search(c["pattern"], norm_path):
-                problems.append(("rule '%s': %s" % (r["id"], r["text"]), r["id"], r["text"]))
-            if (c["type"] == "block_new_files" and tool == "Write"
-                    and fnmatch.fnmatch(base, c["glob"])
-                    and base.lower() not in [a.lower() for a in c.get("allow", [])]
-                    and not os.path.exists(path)):
-                problems.append(("rule '%s': %s (new file: %s)" % (r["id"], r["text"], base), r["id"], r["text"]))
+            if c.get("type") == "deny_path" and _search(c.get("pattern"), norm_path, r.get("id")):
+                hit(r)
+            if c.get("type") == "block_new_files" and tool == "Write" and c.get("glob"):
+                allow = [str(a).lower() for a in (c.get("allow") or [])]
+                if (fnmatch.fnmatch(base.lower(), str(c["glob"]).lower())
+                        and base.lower() not in allow
+                        and not os.path.exists(path)):
+                    hit(r, " (new file: %s)" % base)
         for pat in forbid:
-            if re.search(pat, norm_path):
+            if _search(pat, norm_path, "task-forbid"):
                 problems.append(("task card forbids /%s/" % pat, "task-forbid", pat))
     return problems
-
-
-def inject_subagent_brief(ev, rules, state):
-    """Inject RL brief into Task tool calls for subagent propagation."""
-    if ev.get("tool_name") != "Task":
-        return ev
-    inp = ev.get("tool_input") or {}
-    prompt = inp.get("prompt", "")
-    if not prompt:
-        return ev
-    if "[RULEBOOKY]" in prompt:
-        return ev
-    brief = render(rules, state)
-    if not brief.strip():
-        return ev
-    inp["prompt"] = brief + "\n\n---\n\n" + prompt
-    ev["tool_input"] = inp
-    _call("log_action", "subagent_inject", "Task", {"subagent_type": inp.get("subagent_type", "")}, "injected")
-    return ev
 
 
 def main():
@@ -109,10 +141,6 @@ def main():
     inp = ev.get("tool_input") or {}
     rules = c.load_rules()
     state = c.load_state()
-
-    ev = inject_subagent_brief(ev, rules, state)
-    tool = ev.get("tool_name", "")
-    inp = ev.get("tool_input") or {}
 
     problems = check(ev, rules, state)
     if problems:
