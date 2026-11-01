@@ -45,11 +45,16 @@ def main():
     tool = ev.get("tool_name")
     if not tool:
         return
-    state = c.load_state()
-    if not state.get("task"):
-        return
-    state["counters"][tool] = state["counters"].get(tool, 0) + 1
-    c.save_state(state)
+    with c.state_lock():
+        state = c.load_state()
+        if not state.get("task"):
+            return
+        try:
+            have = int(state["counters"].get(tool, 0))
+        except (TypeError, ValueError):
+            have = 0
+        state["counters"][tool] = have + 1
+        c.save_state(state)
 
 
 if __name__ == "__main__":

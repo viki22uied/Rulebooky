@@ -49,7 +49,7 @@ def problems_for(rules, state):
             probs.append("%s used %d/%d times (required for this task)" % (tool, have, n))
     open_reqs_result = _call("open_reqs", task) or []
     for i, r in open_reqs_result:
-        probs.append("Requirement %d not done with evidence: %s" % (i, r["text"]))
+        probs.append("Requirement %d not done with evidence: %s" % (i, r.get("text", "")))
     return probs
 
 
@@ -59,25 +59,34 @@ def main():
         sys.exit(0)
     c.setup_io()
     c.read_event()
-    rules, state = c.load_rules(), c.load_state()
-    probs = problems_for(rules, state)
-    if not probs:
-        if state.get("stop_blocks"):
-            state["stop_blocks"] = 0
+    rules = c.load_rules()
+    try:
+        limit = int(rules.get("max_stop_blocks", 3))
+    except (TypeError, ValueError):
+        limit = 3
+    with c.state_lock():
+        state = c.load_state()
+        probs = problems_for(rules, state)
+        if not probs:
+            if state.get("stop_blocks"):
+                state["stop_blocks"] = 0
+                c.save_state(state)
+            return
+        if state.get("stop_blocks", 0) >= limit:
+            released = True
+        else:
+            released = False
+            state["stop_blocks"] = state.get("stop_blocks", 0) + 1
             c.save_state(state)
-        return
-    limit = int(rules.get("max_stop_blocks", 3))
-    if state.get("stop_blocks", 0) >= limit:
-        _call("log_action", "stop_block", "Stop", {}, "escape_hatch", "max_stop_blocks", 
-               f"Allowed after {limit} blocks: {'; '.join(probs)}")
+    if released:
+        _call("log_action", "stop_block", "Stop", {}, "escape_hatch", "max_stop_blocks",
+              "Allowed after %d blocks: %s" % (limit, "; ".join(probs)))
         sys.stderr.write("rulebooky: stop allowed after %d blocks, UNMET: %s\n" % (limit, "; ".join(probs)))
         return
-    state["stop_blocks"] = state.get("stop_blocks", 0) + 1
-    c.save_state(state)
     _call("log_action", "stop_block", "Stop", {}, "blocked", "audit", "; ".join(probs))
     sys.stderr.write("Do not finish yet. Unmet:\n- " + "\n- ".join(probs) +
                      "\nDo the work, then mark requirements with: "
-                     "python3 .claude/rulebooky/rulebooky.py task done N --evidence \"...\" "
+                     "python .claude/rulebooky/rulebooky.py task done N --evidence \"...\" "
                      "(or close the task if the user dropped it).\n")
     sys.exit(2)
 
